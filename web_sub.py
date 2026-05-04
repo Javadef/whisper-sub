@@ -8,6 +8,7 @@ import asyncio
 import functools
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -19,6 +20,68 @@ import numpy as np
 import websockets
 from faster_whisper import WhisperModel
 
+# ── AJA / capture device detection ──────────────────────────────────────────
+
+def detect_aja_ntv2() -> list[dict]:
+    """Try AJA NTV2 Python SDK (ajantv2) to enumerate boards."""
+    try:
+        import ajantv2  # type: ignore
+        scanner = ajantv2.CNTV2DeviceScanner()
+        boards = []
+        for i, info in enumerate(scanner.GetDeviceInfoList()):
+            boards.append({"index": i, "name": info.deviceIdentifier,
+                           "serial": getattr(info, "deviceSerialNumber", "?")})
+        return boards
+    except Exception:
+        return []
+
+
+def detect_dshow_devices() -> dict:
+    """Enumerate DirectShow audio/video devices via ffmpeg (Windows only)."""
+    if os.name != "nt":
+        return {"video": [], "audio": []}
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-f", "dshow", "-list_devices", "true", "-i", "dummy"],
+            capture_output=True, text=True, timeout=8,
+        )
+        output = r.stderr
+    except Exception:
+        return {"video": [], "audio": []}
+
+    video: list[str] = []
+    audio: list[str] = []
+    current: list[str] | None = None
+    for line in output.splitlines():
+        if "DirectShow video devices" in line:
+            current = video
+        elif "DirectShow audio devices" in line:
+            current = audio
+        elif current is not None and '"' in line:
+            # Skip "@device" alternative-name lines
+            if "@device" not in line:
+                m = re.search(r'"([^"]+)"', line)
+                if m:
+                    current.append(m.group(1))
+    return {"video": video, "audio": audio}
+
+
+def scan_all_devices() -> dict:
+    """Return combined device info: AJA NTV2 boards + DirectShow devices."""
+    aja   = detect_aja_ntv2()
+    dshow = detect_dshow_devices()
+    # Flag which dshow devices look like AJA
+    aja_names = {b["name"].lower() for b in aja}
+    for lst in (dshow["video"], dshow["audio"]):
+        pass  # already plain strings
+    return {
+        "aja_boards": aja,
+        "dshow": dshow,
+        "aja_dshow_audio": [d for d in dshow["audio"] if "aja" in d.lower()],
+        "aja_dshow_video": [d for d in dshow["video"] if "aja" in d.lower()],
+    }
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 STREAM_URL  = "http://hls.mirtv.cdnvideo.ru/mirtv-parampublish/mir24_2500/playlist.m3u8"
@@ -27,7 +90,7 @@ SAMPLE_RATE = 16000
 CHUNK_SEC   = 5
 OVERLAP_SEC = 0.5
 
-MODEL_SIZE  = "medium"
+MODEL_SIZE  = "large-v3"
 LANGUAGE    = "ru"
 DEVICE      = "cuda"
 COMPUTE     = "float16"
@@ -131,11 +194,22 @@ async def _broadcast_async(payload: str, clients: frozenset) -> None:
 
 # ── Whisper pipeline ──────────────────────────────────────────────────────────
 
-def audio_stream(stop: threading.Event):
-    with _stream_lock:
-        url = _current_stream_url
-    proc = subprocess.Popen(
-        [
+def _build_ffmpeg_args(url: str) -> list[str]:
+    """Build ffmpeg argv for either an HLS/HTTP URL or a dshow:// device."""
+    if url.startswith("dshow://"):
+        device_name = url[len("dshow://"):]
+        return [
+            "ffmpeg",
+            "-f", "dshow",
+            "-i", f"audio={device_name}",
+            "-f", "s16le",
+            "-ar", str(SAMPLE_RATE),
+            "-ac", "1",
+            "-loglevel", "quiet",
+            "pipe:1",
+        ]
+    else:
+        return [
             "ffmpeg", "-re",
             "-i", url,
             "-vn",
@@ -144,7 +218,14 @@ def audio_stream(stop: threading.Event):
             "-ac", "1",
             "-loglevel", "quiet",
             "pipe:1",
-        ],
+        ]
+
+
+def audio_stream(stop: threading.Event):
+    with _stream_lock:
+        url = _current_stream_url
+    proc = subprocess.Popen(
+        _build_ffmpeg_args(url),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
@@ -161,7 +242,8 @@ def audio_stream(stop: threading.Event):
                 pcm  = buf[:bytes_chunk]
                 buf  = buf[bytes_chunk - bytes_overlap:]
                 audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                yield audio
+                # capture_t = wallclock time at the END of the audio chunk
+                yield audio, time.time()
     finally:
         proc.terminate()
 
@@ -172,7 +254,7 @@ def caption_loop() -> None:
     while True:
         _restart_flag.clear()
         stop = threading.Event()
-        for audio in audio_stream(stop):
+        for audio, capture_t in audio_stream(stop):
             if _restart_flag.is_set():
                 stop.set()
                 break
@@ -201,15 +283,17 @@ def caption_loop() -> None:
                 if text:
                     print(f"[{info.language}|{lag:.1f}s] {text}", flush=True)
                     broadcast({
-                        "type":    "caption",
-                        "text":    text,
-                        "lang":    info.language,
-                        "lag":     _stats["lag"],
-                        "lag_avg": _stats["lag_avg"],
-                        "chunks":  _stats["chunks"],
-                        "device":  _stats["device"],
-                        "model":   _stats["model"],
-                        "compute": _stats["compute"],
+                        "type":      "caption",
+                        "text":      text,
+                        "lang":      info.language,
+                        "lag":       _stats["lag"],
+                        "lag_avg":   _stats["lag_avg"],
+                        "chunks":    _stats["chunks"],
+                        "device":    _stats["device"],
+                        "model":     _stats["model"],
+                        "compute":   _stats["compute"],
+                        "audio_t":   capture_t,      # server wallclock at audio END
+                        "server_now": time.time(),   # for clock-skew refresh
                     })
                 else:
                     broadcast({"type": "stats", **_stats})
@@ -234,7 +318,12 @@ async def ws_handler(websocket, *args, **kwargs) -> None:
     with _clients_lock:
         _clients.add(websocket)
     try:
-        await websocket.send(json.dumps({"type": "init", **_stats}))
+        await websocket.send(json.dumps({
+            "type": "init",
+            "server_now": time.time(),
+            "chunk_sec": CHUNK_SEC,
+            **_stats,
+        }))
         async for raw in websocket:
             try:
                 msg = json.loads(raw)
@@ -243,6 +332,10 @@ async def ws_handler(websocket, *args, **kwargs) -> None:
                     if url:
                         set_stream_url(url)
                         broadcast({"type": "stream_changed", "url": url})
+                elif msg.get("type") == "scan_devices":
+                    devices = scan_all_devices()
+                    print(f"[aja] scan: {devices['aja_boards']}", flush=True)
+                    await websocket.send(json.dumps({"type": "devices", **devices}))
             except Exception:
                 pass
     finally:

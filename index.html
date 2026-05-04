@@ -38,19 +38,43 @@ video {
   bottom: 48px;
   left: 50%;
   transform: translateX(-50%);
+  max-width: 92%;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  /* Container itself never hides; lines manage own opacity */
+}
+.cap-line {
   background: rgba(0,0,0,0.78);
   color: #fff;
   font-size: 1.45em;
   font-weight: 500;
   padding: 8px 20px;
   border-radius: 6px;
-  max-width: 92%;
   text-align: center;
   text-shadow: 1px 1px 4px #000;
-  transition: opacity 0.4s;
-  pointer-events: none;
   line-height: 1.4;
   letter-spacing: 0.01em;
+  opacity: 0;
+  transform: translateY(28px) scale(0.97);
+  transition: opacity 0.35s ease, transform 0.45s cubic-bezier(.2,.8,.2,1);
+  white-space: pre-wrap;
+  will-change: transform, opacity;
+}
+.cap-line.show {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+.cap-line.fade-out {
+  opacity: 0;
+  transform: translateY(-22px) scale(0.97);
+}
+.cap-line.prev {
+  opacity: 0.55;
+  font-size: 1.15em;
+  transform: translateY(0) scale(0.95);
 }
 #caption.hidden { opacity: 0; }
 
@@ -81,6 +105,26 @@ video {
 }
 #play-btn:hover { background: rgba(0,0,0,0.92); }
 #play-overlay.hidden { display: none; }
+#fs-btn {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  background: rgba(0,0,0,0.6);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  width: 32px;
+  height: 32px;
+  font-size: 1.1em;
+  cursor: pointer;
+  z-index: 20;
+  opacity: 0.7;
+  transition: opacity 0.2s;
+}
+#fs-btn:hover { opacity: 1; }
+#video-wrap:fullscreen { background:#000; }
+#video-wrap:fullscreen video { width:100%; height:100%; object-fit:contain; }
+#video-wrap:fullscreen #fs-btn { display:none; }
 
 /* ── Debug panel ── */
 #debug {
@@ -186,6 +230,60 @@ video {
 .ctrl-row button:hover { background: #2a4e7a; }
 .ctrl-row span { min-width: 38px; text-align: right; color: #aaa; font-variant-numeric: tabular-nums; }
 
+/* ── AJA device panel ── */
+#aja-panel {
+  border-bottom: 1px solid #181818;
+  flex-shrink: 0;
+}
+#aja-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  font-size: 0.75em;
+  color: #666;
+  cursor: pointer;
+  user-select: none;
+  border-bottom: 1px solid #181818;
+}
+#aja-header:hover { color: #aaa; }
+#aja-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: #444;
+  flex-shrink: 0;
+  transition: background 0.3s;
+}
+#aja-dot.found  { background: #4caf50; }
+#aja-dot.none   { background: #f44336; }
+#aja-dot.scan   { background: #ff9800; }
+#aja-devices {
+  display: none;
+  flex-direction: column;
+  gap: 1px;
+  background: #161616;
+  max-height: 140px;
+  overflow-y: auto;
+}
+#aja-devices.open { display: flex; }
+.dev-row {
+  padding: 6px 14px;
+  font-size: 0.75em;
+  color: #bbb;
+  cursor: pointer;
+  background: #111;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.dev-row:hover { background: #1a2a1a; color: #7fd87f; }
+.dev-row .dev-badge {
+  font-size: 0.7em;
+  color: #555;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
 /* ── Caption log ── */
 #log-wrap {
   flex: 1;
@@ -235,11 +333,12 @@ video {
 
   <!-- Video + caption -->
   <div id="video-wrap">
-    <video id="video" controls playsinline muted autoplay></video>
+    <video id="video" controls controlslist="nofullscreen" playsinline muted autoplay></video>
+    <button id="fs-btn" title="Fullscreen">&#x26F6;</button>
     <div id="play-overlay">
       <div id="play-btn">&#9654;</div>
     </div>
-    <div id="caption" class="hidden"></div>
+    <div id="caption"></div>
   </div>
 
   <!-- Debug panel -->
@@ -295,10 +394,20 @@ video {
       <button id="btn-stream">Load</button>
     </div>
 
-    <!-- Caption delay slider -->
+    <!-- AJA / capture device panel -->
+    <div id="aja-panel">
+      <div id="aja-header">
+        <div id="aja-dot"></div>
+        <span id="aja-title">AJA / Capture Devices</span>
+        <button id="btn-scan" style="margin-left:auto;background:#1a2e1a;border:1px solid #3a6e3a;border-radius:4px;color:#7fd87f;padding:2px 9px;cursor:pointer;font-size:0.9em;">Scan</button>
+      </div>
+      <div id="aja-devices"></div>
+    </div>
+
+    <!-- Caption fine sync slider -->
     <div class="ctrl-row">
-      <label for="sl-delay">Caption delay</label>
-      <input type="range" id="sl-delay" min="0" max="20" step="0.5" value="0">
+      <label for="sl-delay">Caption sync</label>
+      <input type="range" id="sl-delay" min="-5" max="5" step="0.1" value="0">
       <span id="vl-delay">0.0s</span>
     </div>
 
@@ -316,6 +425,13 @@ video {
       <span id="vl-vol">80%</span>
     </div>
 
+    <!-- Video delay slider -->
+    <div class="ctrl-row">
+      <label for="sl-vdelay">Video delay</label>
+      <input type="range" id="sl-vdelay" min="6" max="120" step="1" value="12">
+      <span id="vl-vdelay">12s</span>
+    </div>
+
     <!-- Log -->
     <div id="log-wrap">
       <div id="log"></div>
@@ -330,6 +446,7 @@ video {
 // ── Config ────────────────────────────────────────────────────────────────────
 const STREAM = "http://hls.mirtv.cdnvideo.ru/mirtv-parampublish/mir24_2500/playlist.m3u8";
 const WS_URL = "ws://localhost:8765";
+let videoDelay = 12; // seconds behind live edge
 
 // ── Stream URL input ─────────────────────────────────────────────────────────────────────
 let activeStream = STREAM;
@@ -342,7 +459,7 @@ function loadStream(url) {
   if (urlChanged) {
     if (Hls.isSupported()) {
       if (window._hls) { window._hls.destroy(); }
-      const hls = new Hls({ enableWorker: true, lowLatencyMode: false });
+      const hls = new Hls({ enableWorker: true, lowLatencyMode: false, liveSyncDuration: videoDelay, liveMaxLatencyDuration: videoDelay * 4, backBufferLength: videoDelay * 2 });
       window._hls = hls;
       hls.loadSource(url);
       hls.attachMedia(video);
@@ -382,12 +499,26 @@ video.addEventListener("pause", () => {
   if (!video.seeking) playOverlay.classList.remove("hidden");
 });
 
+// ── Fullscreen via custom button ──
+const videoWrap = document.getElementById("video-wrap");
+document.getElementById("fs-btn").addEventListener("click", () => {
+  if (!document.fullscreenElement) {
+    videoWrap.requestFullscreen().catch(() => {});
+  } else {
+    document.exitFullscreen();
+  }
+});
+document.addEventListener("fullscreenchange", () => {
+  const btn = document.getElementById("fs-btn");
+  if (btn) btn.textContent = document.fullscreenElement ? "\u2716" : "\u26F6";
+});
+
 video.addEventListener("volumechange", () => {
   if (!video.muted && video.paused) video.play().catch(() => {});
 });
 
 if (Hls.isSupported()) {
-  const hls = new Hls({ enableWorker: true, lowLatencyMode: false });
+  const hls = new Hls({ enableWorker: true, lowLatencyMode: false, liveSyncDuration: videoDelay, liveMaxLatencyDuration: videoDelay * 4, backBufferLength: videoDelay * 2 });
   window._hls = hls;
   hls.loadSource(STREAM);
   hls.attachMedia(video);
@@ -407,22 +538,109 @@ if (Hls.isSupported()) {
   });
 }
 
-// ── Caption overlay ───────────────────────────────────────────────────────────
+// ── Caption overlay (wallclock-synced + rolling slide/fade) ─────────────────
 const capEl = document.getElementById("caption");
-let capTimer = null;
-let captionDelay = 0;
-let showDuration = 6000;
+let captionFineSync = 0;       // ±5s nudge for lip-sync
+let serverOffsetMs  = 0;       // server_wall_ms - client_wall_ms (updated on each msg)
+let chunkSec        = 5;       // length of audio window per caption (from server)
+let capFontEm       = 1.45;    // current font size, applied to new lines
 
-function showCaption(text) {
-  const show = () => {
-    if (capTimer) clearTimeout(capTimer);
-    capEl.textContent = text;
-    capEl.classList.remove("hidden");
-    capTimer = setTimeout(() => capEl.classList.add("hidden"), showDuration);
-  };
-  if (captionDelay > 0) setTimeout(show, captionDelay * 1000);
-  else show();
+const WORDS_PER_CHUNK = 8;
+const MS_PER_WORD     = 360;   // ~166 wpm reading rate
+const MIN_HOLD_MS     = 1300;
+const MAX_HOLD_MS     = 6000;
+const FADE_MS         = 350;   // CSS transition length
+
+/**
+ * Schedule a caption to appear at the moment the video frame matching
+ * its source audio is shown on screen.
+ *
+ *   chunk covers audio  [audio_t - chunkSec  ..  audio_t]   (server wall)
+ *   video plays  videoDelay  seconds behind live edge
+ *   ⇒ chunk START heard at  (audio_t - chunkSec) + videoDelay  (server wall)
+ *   ⇒ client time:          audio_t - chunkSec + videoDelay - serverOffset
+ */
+function scheduleCaption(text, audio_t /* sec, server wall */) {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return;
+
+  const groups = [];
+  for (let i = 0; i < words.length; i += WORDS_PER_CHUNK) {
+    groups.push(words.slice(i, i + WORDS_PER_CHUNK).join(' '));
+  }
+
+  const startClientMs =
+      (audio_t - chunkSec) * 1000
+      + videoDelay * 1000
+      + captionFineSync * 1000
+      - serverOffsetMs;
+
+  const evenHold = (chunkSec * 1000) / groups.length;
+  let cursor = startClientMs - Date.now();
+
+  groups.forEach(txt => {
+    const hold = Math.max(MIN_HOLD_MS, Math.min(MAX_HOLD_MS, evenHold));
+    const fireAt = Math.max(0, cursor);
+    setTimeout(() => pushCaption(txt, hold), fireAt);
+    cursor = fireAt + hold;
+  });
 }
+
+/**
+ * Rolling caption: keep most-recent line as primary, demote previous to
+ * smaller "prev" line above. Lines fade/slide; nothing blanks abruptly.
+ */
+let currentLine = null;   // active .cap-line element
+let prevLine    = null;   // previous .cap-line element (smaller, dimmer)
+let currentHideTimer = null;
+
+function pushCaption(text, holdMs) {
+  // 1. Demote currentLine → prevLine
+  if (prevLine) {
+    // Fade out the older prev line
+    const dying = prevLine;
+    dying.classList.add("fade-out");
+    dying.classList.remove("prev", "show");
+    setTimeout(() => dying.remove(), FADE_MS + 50);
+    prevLine = null;
+  }
+  if (currentLine) {
+    if (currentHideTimer) { clearTimeout(currentHideTimer); currentHideTimer = null; }
+    currentLine.classList.remove("show");
+    currentLine.classList.add("prev");
+    prevLine = currentLine;
+  }
+
+  // 2. Build new line, insert at bottom (after prev), animate in
+  const line = document.createElement("div");
+  line.className = "cap-line";
+  line.style.fontSize = capFontEm + "em";
+  line.textContent = text;
+  capEl.appendChild(line);
+  // Force reflow then add show class → triggers transition
+  void line.offsetWidth;
+  line.classList.add("show");
+  currentLine = line;
+
+  // 3. Schedule fade-out of this line if no successor arrives in holdMs
+  currentHideTimer = setTimeout(() => {
+    if (line === currentLine) {
+      line.classList.add("fade-out");
+      line.classList.remove("show");
+      setTimeout(() => {
+        if (line === currentLine) { currentLine = null; }
+        line.remove();
+      }, FADE_MS + 50);
+    }
+  }, holdMs);
+}
+
+function showCaption(text, audio_t) {
+  if (audio_t) scheduleCaption(text, audio_t);
+  else pushCaption(text, 3000);
+}
+
+const CHUNK_SEC = 3;
 
 // ── Sliders ───────────────────────────────────────────────────────────────────
 function mkSlider(id, valId, suffix, onChange) {
@@ -432,8 +650,28 @@ function mkSlider(id, valId, suffix, onChange) {
   sl.addEventListener("input", upd);
   upd();
 }
-mkSlider("sl-delay", "vl-delay", "s",  v => captionDelay = v);
-mkSlider("sl-font",  "vl-font",  "em", v => capEl.style.fontSize = v + "em");
+mkSlider("sl-delay", "vl-delay", "s",  v => captionFineSync = v);
+mkSlider("sl-font",  "vl-font",  "em", v => {
+  capFontEm = v;
+  document.querySelectorAll(".cap-line").forEach(el => el.style.fontSize = v + "em");
+});
+(function() {
+  const sl = document.getElementById("sl-vdelay");
+  const vl = document.getElementById("vl-vdelay");
+  sl.addEventListener("input", () => {
+    videoDelay = parseInt(sl.value);
+    vl.textContent = videoDelay + "s";
+    // Rebuild HLS with new delay
+    if (Hls.isSupported()) {
+      if (window._hls) { window._hls.destroy(); }
+      const hls = new Hls({ enableWorker: true, lowLatencyMode: false, liveSyncDuration: videoDelay, liveMaxLatencyDuration: videoDelay * 4, backBufferLength: videoDelay * 2 });
+      window._hls = hls;
+      hls.loadSource(activeStream);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+    }
+  });
+})();
 (function() {
   const sl = document.getElementById("sl-vol");
   const vl = document.getElementById("vl-vol");
@@ -503,6 +741,11 @@ function connect() {
     let msg;
     try { msg = JSON.parse(evt.data); } catch { return; }
 
+    // Update server↔client clock offset on any msg carrying server_now
+    if (msg.server_now !== undefined) {
+      serverOffsetMs = msg.server_now * 1000 - Date.now();
+    }
+
     if (msg.lang    !== undefined) set("s-lang",    msg.lang,          msg.lang !== "?" ? "good" : "muted");
     if (msg.lag     !== undefined) set("s-lag",     msg.lag + "s",     lagClass(msg.lag));
     if (msg.lag_avg !== undefined) set("s-lag-avg", msg.lag_avg + "s", lagClass(msg.lag_avg));
@@ -512,13 +755,14 @@ function connect() {
     if (msg.compute !== undefined) set("s-compute", msg.compute);
 
     if (msg.type === "init") {
+      if (msg.chunk_sec) chunkSec = msg.chunk_sec;
       addLog(new Date().toLocaleTimeString(), `connected · ${msg.device} / ${msg.model} / ${msg.compute}`, "init");
     }
 
     if (msg.type === "caption" && msg.text) {
       const meta = `${new Date().toLocaleTimeString()}  [${msg.lang}]  lag ${msg.lag}s  avg ${msg.lag_avg}s  #${msg.chunks}`;
       addLog(meta, msg.text);
-      showCaption(msg.text);
+      showCaption(msg.text, msg.audio_t);
     }
 
     if (msg.type === "stream_changed" && msg.url) {
@@ -538,6 +782,108 @@ function connect() {
 }
 
 connect();
+
+// ── AJA / Capture device panel ────────────────────────────────────────────────
+const ajaDot     = document.getElementById("aja-dot");
+const ajaDevs    = document.getElementById("aja-devices");
+const ajaTitle   = document.getElementById("aja-title");
+const ajaHeader  = document.getElementById("aja-header");
+const btnScan    = document.getElementById("btn-scan");
+let ajaOpen = false;
+
+ajaHeader.addEventListener("click", e => {
+  if (e.target === btnScan) return;
+  ajaOpen = !ajaOpen;
+  ajaDevs.classList.toggle("open", ajaOpen);
+});
+
+btnScan.addEventListener("click", e => {
+  e.stopPropagation();
+  ajaDot.className = "scan";
+  ajaTitle.textContent = "Scanning…";
+  ajaDevs.innerHTML = "";
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "scan_devices" }));
+  }
+});
+
+// Handle devices message from server
+const _origOnMessage = ws ? null : null;
+function handleDevicesMsg(msg) {
+  if (msg.type !== "devices") return;
+
+  const boards = msg.aja_boards || [];
+  const ajaAudio = msg.aja_dshow_audio || [];
+  const ajaVideo = msg.aja_dshow_video || [];
+  const allDshow = (msg.dshow && msg.dshow.audio) ? msg.dshow.audio : [];
+
+  const total = boards.length + ajaAudio.length + ajaVideo.length;
+  ajaDot.className = total > 0 ? "found" : "none";
+  ajaTitle.textContent = total > 0
+    ? `AJA / Capture — ${total} device${total > 1 ? "s" : ""} found`
+    : "AJA / Capture — none found";
+
+  ajaDevs.innerHTML = "";
+  ajaOpen = true;
+  ajaDevs.classList.add("open");
+
+  // NTV2 boards
+  boards.forEach(b => {
+    addDevRow(`${b.name}  (board #${b.index})`, "NTV2", () => {
+      // Use first matching dshow audio device if present
+      const match = ajaAudio[0] || null;
+      if (match) useAudioDevice(match);
+      else alert("NTV2 board found but no matching DirectShow audio device detected.\nInstall AJA Desktop Software to expose dshow audio.");
+    });
+  });
+
+  // AJA DirectShow audio inputs
+  ajaAudio.forEach(d => {
+    addDevRow(d, "SDI audio", () => useAudioDevice(d));
+  });
+
+  // AJA DirectShow video inputs
+  ajaVideo.forEach(d => {
+    addDevRow(d, "SDI video", () => {});
+  });
+
+  // If nothing AJA found, show all audio devices as fallback
+  if (total === 0) {
+    allDshow.slice(0, 8).forEach(d => {
+      addDevRow(d, "audio", () => useAudioDevice(d));
+    });
+  }
+}
+
+function addDevRow(name, badge, onClick) {
+  const row = document.createElement("div");
+  row.className = "dev-row";
+  row.innerHTML = `<span>${esc(name)}</span><span class="dev-badge">${esc(badge)}</span>`;
+  row.addEventListener("click", onClick);
+  ajaDevs.appendChild(row);
+}
+
+function useAudioDevice(deviceName) {
+  const url = "dshow://" + deviceName;
+  document.getElementById("inp-stream").value = url;
+  loadStream(url);
+}
+
+// Patch ws.onmessage to also handle devices
+const _origConnect = connect;
+(function patchWs() {
+  const interval = setInterval(() => {
+    if (!ws) return;
+    const orig = ws.onmessage;
+    ws.onmessage = evt => {
+      let msg;
+      try { msg = JSON.parse(evt.data); } catch { if (orig) orig(evt); return; }
+      if (msg.type === "devices") { handleDevicesMsg(msg); return; }
+      if (orig) orig(evt);
+    };
+    clearInterval(interval);
+  }, 100);
+})();
 </script>
 </body>
 </html>
