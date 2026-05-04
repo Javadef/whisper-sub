@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>whisper-sub</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: #0a0a0a;
+  color: #ddd;
+  font-family: 'Segoe UI', system-ui, monospace;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Layout ── */
+#main { display: flex; flex: 1; overflow: hidden; }
+
+/* ── Video ── */
+#video-wrap {
+  flex: 1;
+  position: relative;
+  background: #000;
+  min-width: 0;
+}
+video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+#caption {
+  position: absolute;
+  bottom: 48px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0,0,0,0.78);
+  color: #fff;
+  font-size: 1.45em;
+  font-weight: 500;
+  padding: 8px 20px;
+  border-radius: 6px;
+  max-width: 92%;
+  text-align: center;
+  text-shadow: 1px 1px 4px #000;
+  transition: opacity 0.4s;
+  pointer-events: none;
+  line-height: 1.4;
+  letter-spacing: 0.01em;
+}
+#caption.hidden { opacity: 0; }
+
+#play-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  pointer-events: none;
+  z-index: 10;
+}
+#play-btn {
+  background: rgba(0,0,0,0.72);
+  border: 2px solid rgba(255,255,255,0.35);
+  border-radius: 50%;
+  width: 72px;
+  height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 2em;
+  color: #fff;
+  pointer-events: auto;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+#play-btn:hover { background: rgba(0,0,0,0.92); }
+#play-overlay.hidden { display: none; }
+
+/* ── Debug panel ── */
+#debug {
+  width: 360px;
+  flex-shrink: 0;
+  background: #111;
+  border-left: 1px solid #1e1e1e;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#debug-header {
+  padding: 10px 14px;
+  background: #161616;
+  border-bottom: 1px solid #1e1e1e;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.78em;
+  font-weight: 700;
+  color: #888;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+#ws-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: #f44336;
+  flex-shrink: 0;
+  transition: background 0.3s;
+}
+#ws-dot.ok  { background: #4caf50; }
+#ws-dot.warn { background: #ff9800; }
+
+/* ── Stat grid ── */
+.stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 1px;
+  background: #1a1a1a;
+  border-bottom: 1px solid #1a1a1a;
+  flex-shrink: 0;
+}
+.stat {
+  background: #111;
+  padding: 9px 12px;
+}
+.stat-label {
+  font-size: 0.65em;
+  color: #555;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+.stat-value {
+  font-size: 1.05em;
+  font-weight: 700;
+  color: #ddd;
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.good  { color: #4caf50 !important; }
+.warn  { color: #ff9800 !important; }
+.bad   { color: #f44336 !important; }
+.muted { color: #666    !important; }
+
+/* ── Sliders ── */
+.ctrl-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid #181818;
+  font-size: 0.78em;
+  color: #666;
+  flex-shrink: 0;
+}
+.ctrl-row label { flex-shrink: 0; min-width: 88px; }
+.ctrl-row input[type=text] {
+  flex: 1;
+  background: #1a1a1a;
+  border: 1px solid #2e2e2e;
+  border-radius: 4px;
+  color: #ddd;
+  padding: 3px 8px;
+  font-size: 0.85em;
+  min-width: 0;
+}
+.ctrl-row input[type=text]:focus { outline: none; border-color: #4a90d9; }
+.ctrl-row button {
+  background: #1e3a5f;
+  border: 1px solid #4a90d9;
+  border-radius: 4px;
+  color: #7bb8f5;
+  padding: 3px 10px;
+  cursor: pointer;
+  font-size: 0.8em;
+  flex-shrink: 0;
+}
+.ctrl-row button:hover { background: #2a4e7a; }
+.ctrl-row span { min-width: 38px; text-align: right; color: #aaa; font-variant-numeric: tabular-nums; }
+
+/* ── Caption log ── */
+#log-wrap {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+#log-wrap::-webkit-scrollbar { width: 4px; }
+#log-wrap::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
+
+.log-entry {
+  padding: 6px 14px;
+  border-bottom: 1px solid #161616;
+}
+.log-meta {
+  font-size: 0.68em;
+  color: #444;
+  margin-bottom: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.log-text {
+  font-size: 0.82em;
+  color: #bbb;
+  line-height: 1.45;
+}
+.log-entry.is-error .log-text { color: #f44336; }
+.log-entry.is-error .log-meta { color: #8b3333; }
+.log-entry.is-init .log-text  { color: #4a90d9; }
+
+/* ── Error banner ── */
+#err-banner {
+  display: none;
+  padding: 7px 14px;
+  background: #2a0a0a;
+  border-top: 1px solid #f44336;
+  font-size: 0.75em;
+  color: #f44336;
+  flex-shrink: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+</style>
+</head>
+<body>
+
+<div id="main">
+
+  <!-- Video + caption -->
+  <div id="video-wrap">
+    <video id="video" controls playsinline muted autoplay></video>
+    <div id="play-overlay">
+      <div id="play-btn">&#9654;</div>
+    </div>
+    <div id="caption" class="hidden"></div>
+  </div>
+
+  <!-- Debug panel -->
+  <div id="debug">
+    <div id="debug-header">
+      <div id="ws-dot"></div>
+      whisper-sub debug
+    </div>
+
+    <div class="stat-grid">
+      <div class="stat">
+        <div class="stat-label">Status</div>
+        <div class="stat-value muted" id="s-ws">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Language</div>
+        <div class="stat-value" id="s-lang">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Lag</div>
+        <div class="stat-value" id="s-lag">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Avg Lag×10</div>
+        <div class="stat-value" id="s-lag-avg">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Chunks</div>
+        <div class="stat-value" id="s-chunks">0</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Clients</div>
+        <div class="stat-value" id="s-clients">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Model</div>
+        <div class="stat-value" id="s-model">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Device</div>
+        <div class="stat-value" id="s-device">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Compute</div>
+        <div class="stat-value" id="s-compute">—</div>
+      </div>
+    </div>
+
+    <!-- Stream URL input -->
+    <div class="ctrl-row">
+      <label for="inp-stream">Stream URL</label>
+      <input type="text" id="inp-stream" placeholder="HLS .m3u8 URL" spellcheck="false">
+      <button id="btn-stream">Load</button>
+    </div>
+
+    <!-- Caption delay slider -->
+    <div class="ctrl-row">
+      <label for="sl-delay">Caption delay</label>
+      <input type="range" id="sl-delay" min="0" max="20" step="0.5" value="0">
+      <span id="vl-delay">0.0s</span>
+    </div>
+
+    <!-- Font size slider -->
+    <div class="ctrl-row">
+      <label for="sl-font">Caption size</label>
+      <input type="range" id="sl-font" min="0.8" max="2.8" step="0.1" value="1.45">
+      <span id="vl-font">1.5em</span>
+    </div>
+
+    <!-- Volume slider -->
+    <div class="ctrl-row">
+      <label for="sl-vol">Volume</label>
+      <input type="range" id="sl-vol" min="0" max="100" step="1" value="80">
+      <span id="vl-vol">80%</span>
+    </div>
+
+    <!-- Log -->
+    <div id="log-wrap">
+      <div id="log"></div>
+    </div>
+
+    <div id="err-banner"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+const STREAM = "http://hls.mirtv.cdnvideo.ru/mirtv-parampublish/mir24_2500/playlist.m3u8";
+const WS_URL = "ws://localhost:8765";
+
+// ── Stream URL input ─────────────────────────────────────────────────────────────────────
+let activeStream = STREAM;
+
+function loadStream(url) {
+  if (!url) return;
+  const urlChanged = url !== activeStream;
+  activeStream = url;
+
+  if (urlChanged) {
+    if (Hls.isSupported()) {
+      if (window._hls) { window._hls.destroy(); }
+      const hls = new Hls({ enableWorker: true, lowLatencyMode: false });
+      window._hls = hls;
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+    } else {
+      video.src = url;
+      video.play().catch(() => {});
+    }
+  }
+
+  // Always tell backend — resets _active_language even for same URL
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "set_stream", url }));
+  }
+  addLog(new Date().toLocaleTimeString(), `stream → ${url}`, "init");
+}
+
+const inpStream = document.getElementById("inp-stream");
+const btnStream = document.getElementById("btn-stream");
+inpStream.value = STREAM;
+btnStream.addEventListener("click", () => loadStream(inpStream.value.trim()));
+inpStream.addEventListener("keydown", e => { if (e.key === "Enter") loadStream(inpStream.value.trim()); });
+
+// ── Video ─────────────────────────────────────────────────────────────────────
+const video = document.getElementById("video");
+const playOverlay = document.getElementById("play-overlay");
+
+function tryPlay() {
+  video.play().then(() => {
+    playOverlay.classList.add("hidden");
+  }).catch(() => {});
+}
+
+playOverlay.addEventListener("click", tryPlay);
+video.addEventListener("play", () => playOverlay.classList.add("hidden"));
+video.addEventListener("pause", () => {
+  // only show overlay if not just a seek
+  if (!video.seeking) playOverlay.classList.remove("hidden");
+});
+
+// Volume slider unmutes; keep play overlay independent
+video.addEventListener("volumechange", () => {
+  if (!video.muted && video.paused) video.play().catch(() => {});
+});
+
+if (Hls.isSupported()) {
+  const hls = new Hls({ enableWorker: true, lowLatencyMode: false });
+  window._hls = hls;
+  hls.loadSource(STREAM);
+  hls.attachMedia(video);
+  hls.on(Hls.Events.MANIFEST_PARSED, () => {
+    video.play().then(() => {
+      playOverlay.classList.add("hidden");
+    }).catch(() => {
+      // autoplay blocked — overlay button lets user start
+      playOverlay.classList.remove("hidden");
+    });
+  });
+} else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+  video.src = STREAM;
+  video.play().then(() => {
+    playOverlay.classList.add("hidden");
+  }).catch(() => {
+    playOverlay.classList.remove("hidden");
+  });
+}
+
+// ── Caption overlay ───────────────────────────────────────────────────────────
+const capEl = document.getElementById("caption");
+let capTimer = null;
+let captionDelay = 0;
+let showDuration = 6000;
+
+function showCaption(text) {
+  const show = () => {
+    if (capTimer) clearTimeout(capTimer);
+    capEl.textContent = text;
+    capEl.classList.remove("hidden");
+    capTimer = setTimeout(() => capEl.classList.add("hidden"), showDuration);
+  };
+  if (captionDelay > 0) setTimeout(show, captionDelay * 1000);
+  else show();
+}
+
+// ── Sliders ───────────────────────────────────────────────────────────────────
+function mkSlider(id, valId, suffix, onChange) {
+  const sl = document.getElementById(id);
+  const vl = document.getElementById(valId);
+  const upd = () => { vl.textContent = parseFloat(sl.value).toFixed(1) + suffix; onChange(parseFloat(sl.value)); };
+  sl.addEventListener("input", upd);
+  upd();
+}
+mkSlider("sl-delay", "vl-delay", "s",  v => captionDelay = v);
+mkSlider("sl-font",  "vl-font",  "em", v => capEl.style.fontSize = v + "em");
+// Volume slider: set level + unmute on use
+(function() {
+  const sl = document.getElementById("sl-vol");
+  const vl = document.getElementById("vl-vol");
+  video.volume = parseFloat(sl.value) / 100;
+  vl.textContent = parseFloat(sl.value).toFixed(1) + "%";
+  sl.addEventListener("input", () => {
+    const v = parseFloat(sl.value);
+    vl.textContent = v.toFixed(1) + "%";
+    video.volume = v / 100;
+    video.muted = (v === 0);
+    if (v > 0 && video.paused) tryPlay();
+  });
+})();
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+function set(id, text, cls) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = "stat-value" + (cls ? " " + cls : "");
+}
+function lagClass(v) {
+  if (v <  2) return "good";
+  if (v <  6) return "warn";
+  return "bad";
+}
+
+// ── Log ───────────────────────────────────────────────────────────────────────
+const logEl  = document.getElementById("log");
+const MAX_LOG = 120;
+function addLog(meta, text, type) {
+  const entry = document.createElement("div");
+  entry.className = "log-entry" + (type === "error" ? " is-error" : type === "init" ? " is-init" : "");
+  entry.innerHTML = `<div class="log-meta">${esc(meta)}</div><div class="log-text">${esc(text)}</div>`;
+  logEl.prepend(entry);
+  while (logEl.children.length > MAX_LOG) logEl.lastChild.remove();
+}
+
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+const wsDot    = document.getElementById("ws-dot");
+let ws = null;
+let reconnTimer = null;
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    wsDot.className = "ok";
+    set("s-ws", "connected", "good");
+    clearTimeout(reconnTimer);
+    // send current stream URL to backend on reconnect
+    if (activeStream !== STREAM) {
+      ws.send(JSON.stringify({ type: "set_stream", url: activeStream }));
+    }
+  };
+  ws.onclose = () => {
+    wsDot.className = "warn";
+    set("s-ws", "reconnecting…", "warn");
+    reconnTimer = setTimeout(connect, 2000);
+  };
+  ws.onerror = () => {
+    set("s-ws", "error", "bad");
+  };
+
+  ws.onmessage = evt => {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch { return; }
+
+    // Stat updates
+    if (msg.lang    !== undefined) set("s-lang",    msg.lang,          msg.lang !== "?" ? "good" : "muted");
+    if (msg.lag     !== undefined) set("s-lag",     msg.lag + "s",     lagClass(msg.lag));
+    if (msg.lag_avg !== undefined) set("s-lag-avg", msg.lag_avg + "s", lagClass(msg.lag_avg));
+    if (msg.chunks  !== undefined) set("s-chunks",  msg.chunks);
+    if (msg.model   !== undefined) set("s-model",   msg.model);
+    if (msg.device  !== undefined) set("s-device",  msg.device);
+    if (msg.compute !== undefined) set("s-compute", msg.compute);
+
+    if (msg.type === "init") {
+      addLog(new Date().toLocaleTimeString(), `connected · ${msg.device} / ${msg.model} / ${msg.compute}`, "init");
+    }
+
+    if (msg.type === "caption" && msg.text) {
+      const meta = `${new Date().toLocaleTimeString()}  [${msg.lang}]  lag ${msg.lag}s  avg ${msg.lag_avg}s  #${msg.chunks}`;
+      addLog(meta, msg.text);
+      showCaption(msg.text);
+    }
+
+    if (msg.type === "stream_changed" && msg.url) {
+      inpStream.value = msg.url;
+      activeStream    = msg.url;
+      addLog(new Date().toLocaleTimeString(), `backend stream → ${msg.url}`, "init");
+    }
+
+    if (msg.type === "error") {
+      addLog(new Date().toLocaleTimeString() + "  ERROR", msg.msg, "error");
+      const banner = document.getElementById("err-banner");
+      banner.style.display = "block";
+      banner.textContent = msg.msg;
+      setTimeout(() => banner.style.display = "none", 8000);
+    }
+  };
+}
+
+connect();
+</script>
+</body>
+</html>
