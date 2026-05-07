@@ -235,9 +235,9 @@ video {
 
   <!-- Video + caption -->
   <div id="video-wrap">
-    <video id="video" controls playsinline muted autoplay></video>
+    <video id="video" controls playsinline muted></video>
     <div id="play-overlay">
-      <div id="play-btn">&#9654;</div>
+      <div id="play-btn" style="font-size:0.55em;width:120px;height:120px;border-radius:12px;flex-direction:column;gap:6px;" id="play-btn">&#9654;<span id="play-label" style="font-size:0.75em;color:#aaa;letter-spacing:0.5px;">Loading model…</span></div>
     </div>
     <div id="caption" class="hidden"></div>
   </div>
@@ -293,6 +293,13 @@ video {
       <label for="inp-stream">Stream URL</label>
       <input type="text" id="inp-stream" placeholder="HLS .m3u8 URL" spellcheck="false">
       <button id="btn-stream">Load</button>
+    </div>
+
+    <!-- Stream lag slider -->
+    <div class="ctrl-row">
+      <label for="sl-lag">Stream lag</label>
+      <input type="range" id="sl-lag" min="0" max="20" step="1" value="5">
+      <span id="vl-lag">7s</span>
     </div>
 
     <!-- Caption delay slider -->
@@ -369,11 +376,33 @@ inpStream.addEventListener("keydown", e => { if (e.key === "Enter") loadStream(i
 // ── Video ─────────────────────────────────────────────────────────────────────
 const video = document.getElementById("video");
 const playOverlay = document.getElementById("play-overlay");
+const playLabel = document.getElementById("play-label");
+let modelReady = false;
+let streamLag = 5;  // seconds to buffer behind live edge
+let lagBuffering = false;
 
 function tryPlay() {
-  video.play().then(() => {
-    playOverlay.classList.add("hidden");
-  }).catch(() => {});
+  if (!modelReady) return;  // wait for Whisper model
+  if (streamLag > 0) {
+    // pause immediately so HLS buffers ahead, resume after lag seconds
+    lagBuffering = true;
+    playLabel.textContent = `Buffering ${streamLag}s…`;
+    video.play().then(() => {
+      video.pause();
+      setTimeout(() => {
+        lagBuffering = false;
+        video.play().then(() => {
+          playOverlay.classList.add("hidden");
+        }).catch(() => { playLabel.textContent = "Click to play"; });
+      }, streamLag * 1000);
+    }).catch(() => { playLabel.textContent = "Click to play"; });
+  } else {
+    video.play().then(() => {
+      playOverlay.classList.add("hidden");
+    }).catch(() => {
+      playLabel.textContent = "Click to play";
+    });
+  }
 }
 
 playOverlay.addEventListener("click", tryPlay);
@@ -385,7 +414,7 @@ video.addEventListener("pause", () => {
 
 // Volume slider unmutes; keep play overlay independent
 video.addEventListener("volumechange", () => {
-  if (!video.muted && video.paused) video.play().catch(() => {});
+  if (!video.muted && video.paused && !lagBuffering) video.play().catch(() => {});
 });
 
 if (Hls.isSupported()) {
@@ -394,20 +423,11 @@ if (Hls.isSupported()) {
   hls.loadSource(STREAM);
   hls.attachMedia(video);
   hls.on(Hls.Events.MANIFEST_PARSED, () => {
-    video.play().then(() => {
-      playOverlay.classList.add("hidden");
-    }).catch(() => {
-      // autoplay blocked — overlay button lets user start
-      playOverlay.classList.remove("hidden");
-    });
+    tryPlay();  // no-op until modelReady=true
   });
 } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
   video.src = STREAM;
-  video.play().then(() => {
-    playOverlay.classList.add("hidden");
-  }).catch(() => {
-    playOverlay.classList.remove("hidden");
-  });
+  // play deferred until modelReady
 }
 
 // ── Caption overlay ───────────────────────────────────────────────────────────
@@ -435,6 +455,14 @@ function mkSlider(id, valId, suffix, onChange) {
   sl.addEventListener("input", upd);
   upd();
 }
+// Stream lag slider — value stored; applied on next play start
+(function() {
+  const sl = document.getElementById("sl-lag");
+  const vl = document.getElementById("vl-lag");
+  const upd = () => { streamLag = parseInt(sl.value); vl.textContent = streamLag + "s"; };
+  sl.addEventListener("input", upd);
+  upd();
+})();
 mkSlider("sl-delay", "vl-delay", "s",  v => captionDelay = v);
 mkSlider("sl-font",  "vl-font",  "em", v => capEl.style.fontSize = v + "em");
 // Volume slider: set level + unmute on use
@@ -519,6 +547,9 @@ function connect() {
 
     if (msg.type === "init") {
       addLog(new Date().toLocaleTimeString(), `connected · ${msg.device} / ${msg.model} / ${msg.compute}`, "init");
+      modelReady = true;
+      playLabel.textContent = "Click to play";
+      tryPlay();
     }
 
     if (msg.type === "caption" && msg.text) {
