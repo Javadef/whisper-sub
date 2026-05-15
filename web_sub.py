@@ -8,10 +8,13 @@ import asyncio
 import functools
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
@@ -21,7 +24,7 @@ from faster_whisper import WhisperModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-STREAM_URL  = "http://hls.mirtv.cdnvideo.ru/mirtv-parampublish/mir24_2500/playlist.m3u8"
+STREAM_URL  = "http://213.230.64.74:1510/mix/index.m3u8"
 
 SAMPLE_RATE = 16000
 CHUNK_SEC   = 5
@@ -33,7 +36,14 @@ DEVICE      = "cuda"
 COMPUTE     = "float16"
 
 HTTP_PORT   = 8080
-WS_PORT     = 8765
+WS_PORT     = 8766
+
+# hls_to_sdi.exe control endpoint (burns captions into SDI via ffmpeg drawtext reload)
+SDI_CTRL_URL    = "http://localhost:8765"
+SDI_AUTOSTART   = True   # POST /start on launch + on stream switch
+SDI_EXE_PATH    = Path(__file__).parent / "libajantv2" / "build" / "demos" / "hls_to_sdi" / "Release" / "hls_to_sdi.exe"
+SDI_AUTOLAUNCH  = True   # spawn hls_to_sdi.exe if not already running
+SDI_BROWSER_OFFSET = 16  # seconds: delay SDI behind live edge to match browser HLS buffer
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -60,6 +70,179 @@ def set_stream_url(url: str) -> None:
     _stats["stream"] = url
     _restart_flag.set()
     print(f"[stream] switching to {url}", flush=True)
+    if SDI_AUTOSTART:
+        sdi_start_stream(url)
+
+
+# ── SDI bridge (hls_to_sdi.exe) ──────────────────────────────────────────────
+
+def _sdi_post(path: str, data: dict | None = None) -> None:
+    """Fire-and-forget POST to hls_to_sdi control server.
+    Uses a raw socket so headers+body go in a single sendall(), avoiding the
+    TCP split that causes the C++ server's single recv() to miss the body.
+    """
+    body_bytes = urllib.parse.urlencode(data).encode("utf-8") if data else b""
+    request = (
+        f"POST {path} HTTP/1.0\r\n"
+        f"Host: 127.0.0.1:8765\r\n"
+        f"Content-Type: application/x-www-form-urlencoded\r\n"
+        f"Content-Length: {len(body_bytes)}\r\n"
+        f"Connection: close\r\n"
+        f"\r\n"
+    ).encode("utf-8") + body_bytes
+
+    silent = (path == "/caption")
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(("127.0.0.1", 8765))
+        s.sendall(request)
+        resp = b""
+        try:
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+        except OSError:
+            pass  # WinError 10054 — server closed after writing response
+        finally:
+            s.close()
+        # Check for HTTP error status
+        status_line = resp.split(b"\r\n", 1)[0].decode(errors="replace")
+        parts = status_line.split(" ", 2)
+        if len(parts) >= 2 and not parts[1].startswith("2"):
+            body_resp = resp.split(b"\r\n\r\n", 1)[-1].decode(errors="replace") if b"\r\n\r\n" in resp else ""
+            if not silent:
+                print(f"[sdi] POST {path} HTTP {parts[1]}: {body_resp}", flush=True)
+    except Exception as err:
+        if not silent:
+            print(f"[sdi] POST {path} failed: {err}", flush=True)
+
+
+def _wrap_caption(text: str, max_chars: int = 48) -> str:
+    """Wrap caption to <=2 lines, ~max_chars per line. ffmpeg drawtext has no auto-wrap."""
+    # Strip control chars (tab/VT/CR/etc) that render as boxes/glyphs in drawtext
+    text = "".join(c for c in text if c.isprintable() or c == " ")
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    words = text.split()
+    lines, cur = [], ""
+    for w in words:
+        if cur and len(cur) + 1 + len(w) > max_chars:
+            lines.append(cur)
+            cur = w
+            if len(lines) >= 2:  # only 2 lines max
+                break
+        else:
+            cur = (cur + " " + w) if cur else w
+    if cur and len(lines) < 2:
+        lines.append(cur)
+    return "\n".join(lines)
+
+
+SDI2SDI_CAP_FILE = Path(__file__).parent / "sdi2sdi_cap1.txt"
+
+def sdi_send_caption(text: str) -> None:
+    wrapped = _wrap_caption(text)
+    threading.Thread(target=_sdi_post, args=("/caption", {"text": wrapped}), daemon=True).start()
+    try:
+        SDI2SDI_CAP_FILE.write_text(wrapped, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def sdi_start_stream(url: str) -> None:
+    threading.Thread(target=_sdi_post, args=("/start", {"url": url}), daemon=True).start()
+
+
+def sdi_launch_exe() -> None:
+    if not SDI_AUTOLAUNCH:
+        return
+    if not SDI_EXE_PATH.exists():
+        print(f"[sdi] exe not found: {SDI_EXE_PATH}", flush=True)
+        return
+    # quick probe — already running?
+    already = False
+    try:
+        urllib.request.urlopen(SDI_CTRL_URL + "/status", timeout=0.5).read()
+        already = True
+        print("[sdi] already running", flush=True)
+    except Exception:
+        pass
+    if not already:
+        print(f"[sdi] launching {SDI_EXE_PATH.name}...", flush=True)
+        try:
+            subprocess.Popen(
+                [str(SDI_EXE_PATH)],
+                cwd=str(SDI_EXE_PATH.parent),
+                creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0,
+            )
+        except Exception as err:
+            print(f"[sdi] launch failed: {err}", flush=True)
+            return
+    if SDI_AUTOSTART:
+        threading.Thread(target=_sdi_wait_and_start, args=(STREAM_URL,), daemon=True).start()
+
+
+def _sdi_wait_and_start(url: str, timeout: float = 30.0) -> None:
+    """Poll /status until hls_to_sdi responds, then POST /start."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            urllib.request.urlopen(SDI_CTRL_URL + "/status", timeout=1.0).read()
+            break
+        except Exception:
+            time.sleep(0.5)
+    else:
+        print("[sdi] timed out waiting for exe to start", flush=True)
+        return
+    print(f"[sdi] auto-starting stream: {url}", flush=True)
+    _sdi_post("/start", {"url": url})
+    # verify after 5s — enough time for ffmpeg to open the stream
+    time.sleep(5.0)
+    try:
+        raw  = urllib.request.urlopen(SDI_CTRL_URL + "/status", timeout=2.0).read()
+        data = json.loads(raw)
+        if data.get("running"):
+            print("[sdi] SDI stream running", flush=True)
+            if SDI_BROWSER_OFFSET > 0:
+                # delay SDI behind live edge to match browser HLS buffer
+                # /seek delta=-N sets gSeekOffset=N (N seconds behind live)
+                _sdi_post(f"/seek?delta=-{SDI_BROWSER_OFFSET}")
+                print(f"[sdi] offset -{SDI_BROWSER_OFFSET}s to match browser", flush=True)
+        else:
+            print("[sdi] WARNING: SDI stream not running — check http://localhost:8765 for details", flush=True)
+    except Exception as err:
+        print(f"[sdi] status check failed: {err}", flush=True)
+
+
+SDI_LIVE_SNAP_INTERVAL = 5 * 60  # snap to live edge every 5 minutes
+
+def sdi_watchdog() -> None:
+    """Check SDI stream every 5s; restart if stopped. Snap to live edge periodically."""
+    time.sleep(15)  # initial grace period
+    last_snap = time.monotonic()
+    while True:
+        time.sleep(5)
+        try:
+            raw  = urllib.request.urlopen(SDI_CTRL_URL + "/status", timeout=2.0).read()
+            data = json.loads(raw)
+            if not data.get("running"):
+                with _stream_lock:
+                    url = _current_stream_url
+                print("[sdi] watchdog: stream stopped, restarting...", flush=True)
+                _sdi_post("/start", {"url": url})
+                last_snap = time.monotonic()
+            elif time.monotonic() - last_snap >= SDI_LIVE_SNAP_INTERVAL:
+                # snap back to configured offset from live edge
+                seek_path = f"/seek?delta=-{SDI_BROWSER_OFFSET}" if SDI_BROWSER_OFFSET > 0 else "/seek?delta=0&live=1"
+                print("[sdi] watchdog: snapping to live edge", flush=True)
+                _sdi_post(seek_path)
+                last_snap = time.monotonic()
+        except Exception:
+            pass  # exe not reachable — don't spam
 
 
 _stats = {
@@ -132,38 +315,42 @@ async def _broadcast_async(payload: str, clients: frozenset) -> None:
 # ── Whisper pipeline ──────────────────────────────────────────────────────────
 
 def audio_stream(stop: threading.Event):
-    with _stream_lock:
-        url = _current_stream_url
-    proc = subprocess.Popen(
-        [
-            "ffmpeg", "-re",
-            "-i", url,
-            "-vn",
-            "-f", "s16le",
-            "-ar", str(SAMPLE_RATE),
-            "-ac", "1",
-            "-loglevel", "quiet",
-            "pipe:1",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    bytes_chunk   = SAMPLE_RATE * 2 * CHUNK_SEC
-    bytes_overlap = int(SAMPLE_RATE * 2 * OVERLAP_SEC)
-    buf = b""
-    try:
-        while not stop.is_set():
-            raw = proc.stdout.read(8192)
-            if not raw:
-                break
-            buf += raw
-            while len(buf) >= bytes_chunk:
-                pcm  = buf[:bytes_chunk]
-                buf  = buf[bytes_chunk - bytes_overlap:]
-                audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                yield audio
-    finally:
-        proc.terminate()
+    # Read 16kHz mono s16le PCM from TCP server run by sdi_passthrough.exe
+    SDI_TCP = "tcp://127.0.0.1:9876"
+    while not stop.is_set():
+        try:
+            proc = subprocess.Popen(
+                [
+                    "ffmpeg",
+                    "-f", "s16le", "-ar", "16000", "-ac", "1",
+                    "-i", SDI_TCP,
+                    "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1",
+                    "-loglevel", "quiet",
+                    "pipe:1",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            print(f"[audio] ffmpeg launch failed: {e}", flush=True)
+            time.sleep(2)
+            continue
+        bytes_chunk   = int(SAMPLE_RATE * 2 * CHUNK_SEC)
+        bytes_overlap = int(SAMPLE_RATE * 2 * OVERLAP_SEC)
+        buf = b""
+        try:
+            while not stop.is_set():
+                raw = proc.stdout.read(8192)
+                if not raw:
+                    break
+                buf += raw
+                while len(buf) >= bytes_chunk:
+                    pcm  = buf[:bytes_chunk]
+                    buf  = buf[bytes_chunk - bytes_overlap:]
+                    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                    yield audio
+        finally:
+            proc.terminate()
 
 
 def caption_loop() -> None:
@@ -181,11 +368,11 @@ def caption_loop() -> None:
                 segments, info = _model.transcribe(
                     audio,
                     language=_active_language or None,
-                    vad_filter=True,
-                    vad_parameters={"min_silence_duration_ms": 500},
+                    vad_filter=False,
                 )
                 text = " ".join(s.text.strip() for s in segments).strip()
                 lag  = time.perf_counter() - t0
+                rms  = float(np.sqrt(np.mean(audio ** 2)))
 
                 if not _active_language:
                     _active_language = info.language  # lock to detected lang
@@ -199,7 +386,8 @@ def caption_loop() -> None:
                 _stats["lag_avg"] = round(sum(lag_history) / len(lag_history), 2)
 
                 if text:
-                    print(f"[{info.language}|{lag:.1f}s] {text}", flush=True)
+                    print(f"[{info.language}|{lag:.1f}s|rms={rms:.4f}] {text}", flush=True)
+                    sdi_send_caption(text)
                     broadcast({
                         "type":    "caption",
                         "text":    text,
@@ -212,6 +400,7 @@ def caption_loop() -> None:
                         "compute": _stats["compute"],
                     })
                 else:
+                    print(f"[{info.language}|{lag:.1f}s|rms={rms:.4f}] <silence>", flush=True)
                     broadcast({"type": "stats", **_stats})
 
             except Exception as err:
@@ -253,7 +442,8 @@ async def ws_handler(websocket, *args, **kwargs) -> None:
 async def ws_server_main() -> None:
     global _loop
     _loop = asyncio.get_running_loop()
-    async with websockets.serve(ws_handler, "localhost", WS_PORT):
+    async with websockets.serve(ws_handler, "localhost", WS_PORT,
+                                ping_interval=20, ping_timeout=60):
         print(f"[ws]   ws://localhost:{WS_PORT}", flush=True)
         await asyncio.Future()
 
@@ -291,14 +481,21 @@ def main() -> None:
     check_deps()
     load_model()
 
+    sdi_launch_exe()  # launches exe + auto-starts stream (no browser click needed)
+
     threading.Thread(target=start_http_server, daemon=True).start()
     threading.Thread(target=caption_loop,       daemon=True).start()
+    threading.Thread(target=sdi_watchdog,        daemon=True).start()
 
     print(f"\n>>> http://localhost:{HTTP_PORT} <<<\n", flush=True)
     try:
         asyncio.run(ws_server_main())
     except KeyboardInterrupt:
-        print("\n[exit]")
+        pass
+    finally:
+        print("\n[exit] stopping SDI stream...", flush=True)
+        _sdi_post("/stop")
+        print("[exit] done")
 
 
 if __name__ == "__main__":

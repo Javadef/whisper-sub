@@ -30,7 +30,7 @@ from faster_whisper import WhisperModel
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
-STREAM_URL  = "http://hls.mirtv.cdnvideo.ru/mirtv-parampublish/mir24_2500/playlist.m3u8"
+STREAM_URL  = "http://213.230.64.74:1510/mix/index.m3u8"
 
 SAMPLE_RATE = 16000
 CHUNK_SEC   = 5      # audio window (seconds). larger = more accurate, more lag
