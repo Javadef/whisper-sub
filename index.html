@@ -54,6 +54,19 @@ video {
 }
 #caption.hidden { opacity: 0; }
 
+#watermark {
+  position: absolute;
+  bottom: 12px;
+  right: 16px;
+  color: rgba(255,255,255,0.35);
+  font-size: 0.75em;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  text-shadow: 0 0 4px rgba(0,0,0,0.6);
+  pointer-events: none;
+  user-select: none;
+}
+
 #play-overlay {
   position: absolute;
   inset: 0;
@@ -240,6 +253,7 @@ video {
       <div id="play-btn" style="font-size:0.55em;width:120px;height:120px;border-radius:12px;flex-direction:column;gap:6px;" id="play-btn">&#9654;<span id="play-label" style="font-size:0.75em;color:#aaa;letter-spacing:0.5px;">Loading model…</span></div>
     </div>
     <div id="caption" class="hidden"></div>
+    <div id="watermark">AI</div>
   </div>
 
   <!-- Debug panel -->
@@ -434,7 +448,7 @@ if (Hls.isSupported()) {
 const capEl = document.getElementById("caption");
 let capTimer = null;
 let captionDelay = 0;
-let showDuration = 6000;
+let showDuration = 8000;
 
 function showCaption(text) {
   const show = () => {
@@ -550,6 +564,12 @@ function connect() {
       modelReady = true;
       playLabel.textContent = "Click to play";
       tryPlay();
+    }
+
+    if (msg.type === "stats") {
+      // Clear caption quickly on silence
+      if (capTimer) clearTimeout(capTimer);
+      capEl.classList.add("hidden");
     }
 
     if (msg.type === "caption" && msg.text) {

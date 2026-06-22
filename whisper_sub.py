@@ -38,6 +38,12 @@ OVERLAP_SEC = 0.5    # chunk overlap — preserves words at boundaries
 
 VIDEO_DELAY = 8.0    # seconds to pause MPV at start; tune to match Whisper lag
 
+CAPTION_BLOCKLIST = [
+    "....",
+    "....",
+    "....",
+]
+
 MODEL_SIZE  = "medium"   # tiny | base | small | medium | large-v3
 LANGUAGE    = None        # None = auto-detect; or "ru", "en", etc.
 DEVICE      = "cuda"      # "cuda" or "cpu"
@@ -169,6 +175,10 @@ def caption_loop() -> None:
         lag  = time.perf_counter() - t0
 
         if text:
+            for blocked in CAPTION_BLOCKLIST:
+                if blocked.lower() in text.lower():
+                    text = "••••"
+                    break
             print(f"[{info.language}|{lag:.1f}s lag] {text}", flush=True)
             # {\an2} = ASS bottom-center alignment tag (MPV OSD respects it)
             mpv_cmd(["show-text", r"{\an2}" + text, CAPTION_MS])

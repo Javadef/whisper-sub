@@ -19,8 +19,10 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 import numpy as np
+import torch
 import websockets
 from faster_whisper import WhisperModel
+from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -31,9 +33,12 @@ CHUNK_SEC   = 5
 OVERLAP_SEC = 0.5
 
 MODEL_SIZE  = "medium"
-LANGUAGE    = "ru"
+LANGUAGE    = "uz"
 DEVICE      = "cuda"
 COMPUTE     = "float16"
+
+USE_KOTIB  = True   # Use Kotib/uzbek_stt_v1 (Uzbek fine-tune). False = faster-whisper generic
+KOTIB_MODEL = "Kotib/uzbek_stt_v1"
 
 HTTP_PORT   = 8080
 WS_PORT     = 8766
@@ -45,9 +50,17 @@ SDI_EXE_PATH    = Path(__file__).parent / "libajantv2" / "build" / "demos" / "hl
 SDI_AUTOLAUNCH  = True   # spawn hls_to_sdi.exe if not already running
 SDI_BROWSER_OFFSET = 16  # seconds: delay SDI behind live edge to match browser HLS buffer
 
+CAPTION_BLOCKLIST = [
+    "Редактор субтитров",
+    "Корректор",
+    "Фондю любит тебя",
+]
+
 # ─────────────────────────────────────────────────────────────────────────────
 
-_model: WhisperModel | None = None
+_model: WhisperModel | WhisperForConditionalGeneration | None = None
+_processor: WhisperProcessor | None = None
+_device: str = "cpu"
 _clients: set = set()
 _clients_lock = threading.Lock()
 _loop: asyncio.AbstractEventLoop | None = None
@@ -278,7 +291,23 @@ def setup_cuda_dll_paths() -> None:
 
 
 def load_model() -> None:
-    global _model
+    global _model, _processor, _device
+    if USE_KOTIB:
+        print(f"[kotib] Loading {KOTIB_MODEL}...", flush=True)
+        setup_cuda_dll_paths()
+        _device = "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            _processor = WhisperProcessor.from_pretrained(KOTIB_MODEL)
+            _model = WhisperForConditionalGeneration.from_pretrained(KOTIB_MODEL).to(_device)
+            _stats["device"]  = _device
+            _stats["model"]   = "Kotib/uzbek_stt_v1"
+            _stats["compute"] = "fp32"
+        except Exception as err:
+            print(f"[kotib] Load failed: {err}", flush=True)
+            sys.exit(1)
+        print(f"[kotib] Ready on {_device}.", flush=True)
+        return
+
     print(f"[whisper] Loading {MODEL_SIZE}...", flush=True)
     setup_cuda_dll_paths()
     try:
@@ -365,20 +394,35 @@ def caption_loop() -> None:
                 break
             t0 = time.perf_counter()
             try:
-                segments, info = _model.transcribe(
-                    audio,
-                    language=_active_language or None,
-                    vad_filter=False,
-                )
-                text = " ".join(s.text.strip() for s in segments).strip()
+                if USE_KOTIB:
+                    input_features = _processor(audio, sampling_rate=16000, return_tensors="pt").input_features.to(_device)
+                    with torch.no_grad():
+                        predicted_ids = _model.generate(
+                            input_features,
+                            language="uz",
+                            task="transcribe",
+                            attention_mask=torch.ones(input_features.shape[:2], device=_device),
+                        )
+                    text = _processor.batch_decode(predicted_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0].strip()
+                    lang = "uz"
+                    if not _active_language:
+                        _active_language = "uz"
+                else:
+                    segments, info = _model.transcribe(
+                        audio,
+                        language=_active_language or None,
+                        vad_filter=False,
+                    )
+                    text = " ".join(s.text.strip() for s in segments).strip()
+                    lang = info.language
+                    if not _active_language:
+                        _active_language = info.language
+
                 lag  = time.perf_counter() - t0
                 rms  = float(np.sqrt(np.mean(audio ** 2)))
 
-                if not _active_language:
-                    _active_language = info.language  # lock to detected lang
-
                 _stats["chunks"] += 1
-                _stats["lang"]    = info.language
+                _stats["lang"]    = lang
                 _stats["lag"]     = round(lag, 2)
                 lag_history.append(lag)
                 if len(lag_history) > 10:
@@ -386,12 +430,16 @@ def caption_loop() -> None:
                 _stats["lag_avg"] = round(sum(lag_history) / len(lag_history), 2)
 
                 if text:
-                    print(f"[{info.language}|{lag:.1f}s|rms={rms:.4f}] {text}", flush=True)
+                    for blocked in CAPTION_BLOCKLIST:
+                        if blocked.lower() in text.lower():
+                            text = "••••"
+                            break
+                    print(f"[{lang}|{lag:.1f}s|rms={rms:.4f}] {text}", flush=True)
                     sdi_send_caption(text)
                     broadcast({
                         "type":    "caption",
                         "text":    text,
-                        "lang":    info.language,
+                        "lang":    lang,
                         "lag":     _stats["lag"],
                         "lag_avg": _stats["lag_avg"],
                         "chunks":  _stats["chunks"],
@@ -400,7 +448,7 @@ def caption_loop() -> None:
                         "compute": _stats["compute"],
                     })
                 else:
-                    print(f"[{info.language}|{lag:.1f}s|rms={rms:.4f}] <silence>", flush=True)
+                    print(f"[{lang}|{lag:.1f}s|rms={rms:.4f}] <silence>", flush=True)
                     broadcast({"type": "stats", **_stats})
 
             except Exception as err:

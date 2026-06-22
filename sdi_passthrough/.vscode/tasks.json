@@ -1,0 +1,14 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build and Run sdi_passthrough",
+			"type": "shell",
+			"command": "Stop-Process -Name sdi_passthrough -Force -ErrorAction SilentlyContinue; cmake --build build --config Release; .\\build\\Release\\sdi_passthrough.exe",
+			"isBackground": true,
+			"problemMatcher": [
+				"$gcc"
+			]
+		}
+	]
+}

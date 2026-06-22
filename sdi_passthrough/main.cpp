@@ -264,6 +264,96 @@ static void DrawSubtitle(uint8_t* buf, int stride, int frameW, int frameH,
     ReleaseDC(nullptr, hdcRef);
 }
 
+// Draw small "AI" watermark at bottom-right corner, semi-transparent.
+static void DrawWatermark(uint8_t* buf, int stride, int frameW, int frameH)
+{
+    static const wchar_t* kWText = L"AI";
+    static const int kFontPx = 28;
+    static const int kPad = 8;
+    static const int kMarginRight = 12;
+    static const int kMarginBottom = 12;
+    static const int kAlpha = 160;  // ~63% opacity
+
+    HDC   hdcRef = GetDC(nullptr);
+    HDC   hdcMem = CreateCompatibleDC(hdcRef);
+    HFONT hFont  = CreateFontW(-kFontPx, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                               NONANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+    auto* hOldFont = static_cast<HFONT>(SelectObject(hdcMem, hFont));
+
+    RECT rc{ 0, 0, 200, 100 };
+    DrawTextW(hdcMem, kWText, -1, &rc, DT_CALCRECT | DT_NOPREFIX);
+    int textW = rc.right - rc.left;
+    int textH = rc.bottom - rc.top;
+
+    int bmpW = (textW + kPad * 2 + 1) & ~1;
+    int bmpH = textH + kPad * 2;
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = bmpW;
+    bmi.bmiHeader.biHeight      = -bmpH;
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void*   pBits = nullptr;
+    HBITMAP hBmp  = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+    auto*   hOldBmp = static_cast<HBITMAP>(SelectObject(hdcMem, hBmp));
+
+    HBRUSH hBrush = CreateSolidBrush(RGB(0, 0, 0));
+    RECT   rcFill{ 0, 0, bmpW, bmpH };
+    FillRect(hdcMem, &rcFill, hBrush);
+    DeleteObject(hBrush);
+
+    SetTextColor(hdcMem, RGB(255, 255, 255));
+    SetBkMode(hdcMem, TRANSPARENT);
+    RECT rcText{ kPad, kPad, kPad + textW, kPad + textH };
+    DrawTextW(hdcMem, kWText, -1, &rcText, DT_NOPREFIX);
+    GdiFlush();
+
+    int dstX = (frameW - bmpW - kMarginRight) & ~1;
+    int dstY = frameH - bmpH - kMarginBottom;
+
+    if (pBits && dstX >= 0 && dstY >= 0)
+    {
+        int copyW = (bmpW < frameW - dstX ? bmpW : frameW - dstX) & ~1;
+        int copyH = (bmpH < frameH - dstY ? bmpH : frameH - dstY);
+        auto* pixels = static_cast<const uint8_t*>(pBits);
+        int dibStride = bmpW * 4;
+
+        auto toY = [](uint8_t R, uint8_t G, uint8_t B) -> uint8_t {
+            return static_cast<uint8_t>(16 + ((R * 66 + G * 129 + B * 25 + 128) >> 8));
+        };
+
+        for (int row = 0; row < copyH; ++row)
+        {
+            const uint8_t* srcRow = pixels + row * dibStride;
+            for (int col = 0; col < copyW; col += 2)
+            {
+                const uint8_t* p0 = srcRow + col * 4;
+                const uint8_t* p1 = p0 + 4;
+                uint8_t wY0 = toY(p0[2], p0[1], p0[0]);
+                uint8_t wY1 = toY(p1[2], p1[1], p1[0]);
+
+                uint8_t* dst = buf + (dstY + row) * stride + ((dstX + col) / 2) * 4;
+                dst[1] = (uint8_t)(((int)wY0 * kAlpha + (int)dst[1] * (255 - kAlpha)) / 255);
+                dst[3] = (uint8_t)(((int)wY1 * kAlpha + (int)dst[3] * (255 - kAlpha)) / 255);
+                // Neutral chroma
+                dst[0] = (uint8_t)(((int)128 * kAlpha + (int)dst[0] * (255 - kAlpha)) / 255);
+                dst[2] = (uint8_t)(((int)128 * kAlpha + (int)dst[2] * (255 - kAlpha)) / 255);
+            }
+        }
+    }
+
+    SelectObject(hdcMem, hOldBmp);
+    SelectObject(hdcMem, hOldFont);
+    DeleteObject(hBmp);
+    DeleteObject(hFont);
+    DeleteDC(hdcMem);
+    ReleaseDC(nullptr, hdcRef);
+}
+
 // ---------------------------------------------------------------------------
 
 int main()
@@ -550,6 +640,8 @@ int main()
         DrawSubtitle(reinterpret_cast<uint8_t*>(vidBufs[ri].data()),
                      stride, static_cast<int>(W), static_cast<int>(H),
                      Utf8ToWide(ReadSubtitleFile(kSubtitleFile)));
+        DrawWatermark(reinterpret_cast<uint8_t*>(vidBufs[ri].data()),
+                      stride, static_cast<int>(W), static_cast<int>(H));
         outXfer.SetVideoBuffer(vidBufs[ri].data(), fSize);
         outXfer.SetAudioBuffer(audBufs[ri].data(), audBytesArr[ri]);
         if (device.AutoCirculateTransfer(outCh, outXfer)) nOut++;
