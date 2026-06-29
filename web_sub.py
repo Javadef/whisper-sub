@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
 """
-whisper-sub web: faster-whisper → WebSocket → browser HLS player
-No MPV required. Open http://localhost:8080 after launch.
+Whisper Subtitle Overlay — speech-to-text via Kotib/uzbek_stt_v1 or faster-whisper,
+broadcasts captions over WebSocket, writes to sdi2sdi_cap1.txt for SDI overlay.
+Open http://localhost:8080 after launch.
 """
 
 import asyncio
-import functools
 import json
 import os
-import socket
 import subprocess
 import sys
 import threading
 import time
-import urllib.parse
-import urllib.request
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+
+# ── CUDA DLL paths must be set BEFORE importing torch (Windows) ───────────────
+
+def _setup_cuda_dll_paths() -> None:
+    if os.name != "nt":
+        return
+    for p in {sys.prefix, sys.base_prefix}:
+        for d in ("cudnn", "cublas", "cuda_nvrtc"):
+            dll_dir = Path(p) / "Lib" / "site-packages" / "nvidia" / d / "bin"
+            if dll_dir.is_dir():
+                try:
+                    os.add_dll_directory(str(dll_dir))
+                except (AttributeError, FileNotFoundError):
+                    pass
+                os.environ["PATH"] = str(dll_dir) + os.pathsep + os.environ.get("PATH", "")
+
+_setup_cuda_dll_paths()
 
 import numpy as np
 import torch
@@ -24,10 +38,9 @@ import websockets
 from faster_whisper import WhisperModel
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Configuration ────────────────────────────────────────────────────────────
 
 STREAM_URL  = "http://213.230.64.74:1510/mix/index.m3u8"
-
 SAMPLE_RATE = 16000
 CHUNK_SEC   = 5
 OVERLAP_SEC = 0.5
@@ -37,264 +50,78 @@ LANGUAGE    = "uz"
 DEVICE      = "cuda"
 COMPUTE     = "float16"
 
-USE_KOTIB  = True   # Use Kotib/uzbek_stt_v1 (Uzbek fine-tune). False = faster-whisper generic
+USE_KOTIB   = True
 KOTIB_MODEL = "Kotib/uzbek_stt_v1"
 
 HTTP_PORT   = 8080
 WS_PORT     = 8766
 
-# hls_to_sdi.exe control endpoint (burns captions into SDI via ffmpeg drawtext reload)
-SDI_CTRL_URL    = "http://localhost:8765"
-SDI_AUTOSTART   = True   # POST /start on launch + on stream switch
-SDI_EXE_PATH    = Path(__file__).parent / "libajantv2" / "build" / "demos" / "hls_to_sdi" / "Release" / "hls_to_sdi.exe"
-SDI_AUTOLAUNCH  = True   # spawn hls_to_sdi.exe if not already running
-SDI_BROWSER_OFFSET = 16  # seconds: delay SDI behind live edge to match browser HLS buffer
+SDI_EXE_PATH   = Path(__file__).parent / "sdi_passthrough" / "build" / "Release" / "sdi_passthrough.exe"
+SDI_AUTOLAUNCH = True
 
-CAPTION_BLOCKLIST = [
+CAPTION_BLOCKLIST = (
     "Редактор субтитров",
     "Корректор",
     "Фондю любит тебя",
-]
+)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Global state ─────────────────────────────────────────────────────────────
 
-_model: WhisperModel | WhisperForConditionalGeneration | None = None
-_processor: WhisperProcessor | None = None
-_device: str = "cpu"
-_clients: set = set()
+_model:      WhisperModel | WhisperForConditionalGeneration | None = None
+_processor:  WhisperProcessor | None = None
+_device:     str = "cpu"
+_clients:    set = set()
 _clients_lock = threading.Lock()
-_loop: asyncio.AbstractEventLoop | None = None
+_loop:       asyncio.AbstractEventLoop | None = None
 
-# ── Stream hot-reload ─────────────────────────────────────────────────────────
-if sys.version_info >= (3, 9):
-    _current_stream_url: str = STREAM_URL
-else:
-    _current_stream_url = STREAM_URL
-_stream_lock        = threading.Lock()
-_restart_flag       = threading.Event()
-_active_language    = LANGUAGE   # reset to "" on stream switch → forces re-detect
+_current_stream_url: str = STREAM_URL
+_stream_lock     = threading.Lock()
+_restart_flag    = threading.Event()
+_active_language = LANGUAGE
 
+_stats = {
+    "chunks":   0, "lang": "?", "lag": 0.0, "lag_avg": 0.0,
+    "errors":   [], "device": DEVICE, "model": MODEL_SIZE,
+    "compute":  COMPUTE, "stream": STREAM_URL,
+}
 
-def set_stream_url(url: str) -> None:
-    global _current_stream_url, _active_language
-    with _stream_lock:
-        _current_stream_url = url
-    _active_language = ""   # force re-detect on new stream
-    _stats["stream"] = url
-    _restart_flag.set()
-    print(f"[stream] switching to {url}", flush=True)
-    if SDI_AUTOSTART:
-        sdi_start_stream(url)
-
-
-# ── SDI bridge (hls_to_sdi.exe) ──────────────────────────────────────────────
-
-def _sdi_post(path: str, data: dict | None = None) -> None:
-    """Fire-and-forget POST to hls_to_sdi control server.
-    Uses a raw socket so headers+body go in a single sendall(), avoiding the
-    TCP split that causes the C++ server's single recv() to miss the body.
-    """
-    body_bytes = urllib.parse.urlencode(data).encode("utf-8") if data else b""
-    request = (
-        f"POST {path} HTTP/1.0\r\n"
-        f"Host: 127.0.0.1:8765\r\n"
-        f"Content-Type: application/x-www-form-urlencoded\r\n"
-        f"Content-Length: {len(body_bytes)}\r\n"
-        f"Connection: close\r\n"
-        f"\r\n"
-    ).encode("utf-8") + body_bytes
-
-    silent = (path == "/caption")
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2.0)
-        s.connect(("127.0.0.1", 8765))
-        s.sendall(request)
-        resp = b""
-        try:
-            while True:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                resp += chunk
-        except OSError:
-            pass  # WinError 10054 — server closed after writing response
-        finally:
-            s.close()
-        # Check for HTTP error status
-        status_line = resp.split(b"\r\n", 1)[0].decode(errors="replace")
-        parts = status_line.split(" ", 2)
-        if len(parts) >= 2 and not parts[1].startswith("2"):
-            body_resp = resp.split(b"\r\n\r\n", 1)[-1].decode(errors="replace") if b"\r\n\r\n" in resp else ""
-            if not silent:
-                print(f"[sdi] POST {path} HTTP {parts[1]}: {body_resp}", flush=True)
-    except Exception as err:
-        if not silent:
-            print(f"[sdi] POST {path} failed: {err}", flush=True)
-
-
-def _wrap_caption(text: str, max_chars: int = 48) -> str:
-    """Wrap caption to <=2 lines, ~max_chars per line. ffmpeg drawtext has no auto-wrap."""
-    # Strip control chars (tab/VT/CR/etc) that render as boxes/glyphs in drawtext
-    text = "".join(c for c in text if c.isprintable() or c == " ")
-    text = text.strip()
-    if len(text) <= max_chars:
-        return text
-    words = text.split()
-    lines, cur = [], ""
-    for w in words:
-        if cur and len(cur) + 1 + len(w) > max_chars:
-            lines.append(cur)
-            cur = w
-            if len(lines) >= 2:  # only 2 lines max
-                break
-        else:
-            cur = (cur + " " + w) if cur else w
-    if cur and len(lines) < 2:
-        lines.append(cur)
-    return "\n".join(lines)
-
+# ── SDI passthrough ──────────────────────────────────────────────────────────
 
 SDI2SDI_CAP_FILE = Path(__file__).parent / "sdi2sdi_cap1.txt"
 
 def sdi_send_caption(text: str) -> None:
     wrapped = _wrap_caption(text)
-    threading.Thread(target=_sdi_post, args=("/caption", {"text": wrapped}), daemon=True).start()
     try:
         SDI2SDI_CAP_FILE.write_text(wrapped, encoding="utf-8")
     except OSError:
         pass
 
-
-def sdi_start_stream(url: str) -> None:
-    threading.Thread(target=_sdi_post, args=("/start", {"url": url}), daemon=True).start()
-
-
 def sdi_launch_exe() -> None:
-    if not SDI_AUTOLAUNCH:
+    if not SDI_AUTOLAUNCH or not SDI_EXE_PATH.exists():
         return
-    if not SDI_EXE_PATH.exists():
-        print(f"[sdi] exe not found: {SDI_EXE_PATH}", flush=True)
-        return
-    # quick probe — already running?
-    already = False
     try:
-        urllib.request.urlopen(SDI_CTRL_URL + "/status", timeout=0.5).read()
-        already = True
-        print("[sdi] already running", flush=True)
+        out = subprocess.check_output(["tasklist"], creationflags=subprocess.CREATE_NO_WINDOW)
+        if b"sdi_passthrough" in out:
+            print("[sdi] already running", flush=True)
+            return
     except Exception:
         pass
-    if not already:
-        print(f"[sdi] launching {SDI_EXE_PATH.name}...", flush=True)
-        try:
-            subprocess.Popen(
-                [str(SDI_EXE_PATH)],
-                cwd=str(SDI_EXE_PATH.parent),
-                creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0,
-            )
-        except Exception as err:
-            print(f"[sdi] launch failed: {err}", flush=True)
-            return
-    if SDI_AUTOSTART:
-        threading.Thread(target=_sdi_wait_and_start, args=(STREAM_URL,), daemon=True).start()
-
-
-def _sdi_wait_and_start(url: str, timeout: float = 30.0) -> None:
-    """Poll /status until hls_to_sdi responds, then POST /start."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            urllib.request.urlopen(SDI_CTRL_URL + "/status", timeout=1.0).read()
-            break
-        except Exception:
-            time.sleep(0.5)
-    else:
-        print("[sdi] timed out waiting for exe to start", flush=True)
-        return
-    print(f"[sdi] auto-starting stream: {url}", flush=True)
-    _sdi_post("/start", {"url": url})
-    # verify after 5s — enough time for ffmpeg to open the stream
-    time.sleep(5.0)
+    print(f"[sdi] launching {SDI_EXE_PATH.name}...", flush=True)
     try:
-        raw  = urllib.request.urlopen(SDI_CTRL_URL + "/status", timeout=2.0).read()
-        data = json.loads(raw)
-        if data.get("running"):
-            print("[sdi] SDI stream running", flush=True)
-            if SDI_BROWSER_OFFSET > 0:
-                # delay SDI behind live edge to match browser HLS buffer
-                # /seek delta=-N sets gSeekOffset=N (N seconds behind live)
-                _sdi_post(f"/seek?delta=-{SDI_BROWSER_OFFSET}")
-                print(f"[sdi] offset -{SDI_BROWSER_OFFSET}s to match browser", flush=True)
-        else:
-            print("[sdi] WARNING: SDI stream not running — check http://localhost:8765 for details", flush=True)
+        subprocess.Popen(
+            [str(SDI_EXE_PATH)],
+            cwd=str(SDI_EXE_PATH.parent),
+            creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0,
+        )
     except Exception as err:
-        print(f"[sdi] status check failed: {err}", flush=True)
+        print(f"[sdi] launch failed: {err}", flush=True)
 
-
-SDI_LIVE_SNAP_INTERVAL = 5 * 60  # snap to live edge every 5 minutes
-
-def sdi_watchdog() -> None:
-    """Check SDI stream every 5s; restart if stopped. Snap to live edge periodically."""
-    time.sleep(15)  # initial grace period
-    last_snap = time.monotonic()
-    while True:
-        time.sleep(5)
-        try:
-            raw  = urllib.request.urlopen(SDI_CTRL_URL + "/status", timeout=2.0).read()
-            data = json.loads(raw)
-            if not data.get("running"):
-                with _stream_lock:
-                    url = _current_stream_url
-                print("[sdi] watchdog: stream stopped, restarting...", flush=True)
-                _sdi_post("/start", {"url": url})
-                last_snap = time.monotonic()
-            elif time.monotonic() - last_snap >= SDI_LIVE_SNAP_INTERVAL:
-                # snap back to configured offset from live edge
-                seek_path = f"/seek?delta=-{SDI_BROWSER_OFFSET}" if SDI_BROWSER_OFFSET > 0 else "/seek?delta=0&live=1"
-                print("[sdi] watchdog: snapping to live edge", flush=True)
-                _sdi_post(seek_path)
-                last_snap = time.monotonic()
-        except Exception:
-            pass  # exe not reachable — don't spam
-
-
-_stats = {
-    "chunks":    0,
-    "lang":      "?",
-    "lag":       0.0,
-    "lag_avg":   0.0,
-    "errors":    [],
-    "device":    DEVICE,
-    "model":     MODEL_SIZE,
-    "compute":   COMPUTE,
-    "stream":    STREAM_URL,
-}
-
-
-# ── CUDA ──────────────────────────────────────────────────────────────────────
-
-def setup_cuda_dll_paths() -> None:
-    if os.name != "nt":
-        return
-    candidates = [
-        Path(sys.prefix) / "Lib" / "site-packages" / "nvidia" / "cudnn"       / "bin",
-        Path(sys.prefix) / "Lib" / "site-packages" / "nvidia" / "cublas"      / "bin",
-        Path(sys.prefix) / "Lib" / "site-packages" / "nvidia" / "cuda_nvrtc"  / "bin",
-    ]
-    for dll_dir in candidates:
-        if dll_dir.exists():
-            try:
-                os.add_dll_directory(str(dll_dir))
-            except (AttributeError, FileNotFoundError):
-                pass
-            os.environ["PATH"] = str(dll_dir) + os.pathsep + os.environ.get("PATH", "")
-
+# ── Model loader ─────────────────────────────────────────────────────────────
 
 def load_model() -> None:
     global _model, _processor, _device
     if USE_KOTIB:
         print(f"[kotib] Loading {KOTIB_MODEL}...", flush=True)
-        setup_cuda_dll_paths()
         _device = "cuda" if torch.cuda.is_available() else "cpu"
         try:
             _processor = WhisperProcessor.from_pretrained(KOTIB_MODEL)
@@ -309,7 +136,6 @@ def load_model() -> None:
         return
 
     print(f"[whisper] Loading {MODEL_SIZE}...", flush=True)
-    setup_cuda_dll_paths()
     try:
         _model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE)
         _stats["device"] = DEVICE
@@ -320,8 +146,16 @@ def load_model() -> None:
         _stats["compute"] = "int8"
     print("[whisper] Model ready.", flush=True)
 
+# ── Caption wrapping ─────────────────────────────────────────────────────────
 
-# ── WebSocket broadcast ───────────────────────────────────────────────────────
+def _wrap_caption(text: str, max_chars: int = 80) -> str:
+    text = "".join(c for c in text if c.isprintable() or c == " ")
+    text = text.strip()
+    if len(text) > max_chars:
+        text = text[:max_chars - 3] + "..."
+    return text
+
+# ── WebSocket broadcast ──────────────────────────────────────────────────────
 
 def broadcast(msg: dict) -> None:
     if _loop is None:
@@ -332,7 +166,6 @@ def broadcast(msg: dict) -> None:
     if clients:
         asyncio.run_coroutine_threadsafe(_broadcast_async(payload, clients), _loop)
 
-
 async def _broadcast_async(payload: str, clients: frozenset) -> None:
     for ws in clients:
         try:
@@ -340,11 +173,9 @@ async def _broadcast_async(payload: str, clients: frozenset) -> None:
         except Exception:
             pass
 
-
-# ── Whisper pipeline ──────────────────────────────────────────────────────────
+# ── Audio capture (via sdi_passthrough.exe TCP) ──────────────────────────────
 
 def audio_stream(stop: threading.Event):
-    # Read 16kHz mono s16le PCM from TCP server run by sdi_passthrough.exe
     SDI_TCP = "tcp://127.0.0.1:9876"
     while not stop.is_set():
         try:
@@ -374,13 +205,14 @@ def audio_stream(stop: threading.Event):
                     break
                 buf += raw
                 while len(buf) >= bytes_chunk:
-                    pcm  = buf[:bytes_chunk]
-                    buf  = buf[bytes_chunk - bytes_overlap:]
+                    pcm = buf[:bytes_chunk]
+                    buf = buf[bytes_chunk - bytes_overlap:]
                     audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
                     yield audio
         finally:
             proc.terminate()
 
+# ── Transcription loop ───────────────────────────────────────────────────────
 
 def caption_loop() -> None:
     global _active_language
@@ -418,8 +250,8 @@ def caption_loop() -> None:
                     if not _active_language:
                         _active_language = info.language
 
-                lag  = time.perf_counter() - t0
-                rms  = float(np.sqrt(np.mean(audio ** 2)))
+                lag = time.perf_counter() - t0
+                rms = float(np.sqrt(np.mean(audio ** 2)))
 
                 _stats["chunks"] += 1
                 _stats["lang"]    = lang
@@ -436,17 +268,7 @@ def caption_loop() -> None:
                             break
                     print(f"[{lang}|{lag:.1f}s|rms={rms:.4f}] {text}", flush=True)
                     sdi_send_caption(text)
-                    broadcast({
-                        "type":    "caption",
-                        "text":    text,
-                        "lang":    lang,
-                        "lag":     _stats["lag"],
-                        "lag_avg": _stats["lag_avg"],
-                        "chunks":  _stats["chunks"],
-                        "device":  _stats["device"],
-                        "model":   _stats["model"],
-                        "compute": _stats["compute"],
-                    })
+                    broadcast({"type": "caption", "text": text, "lang": lang, "lag": _stats["lag"], "lag_avg": _stats["lag_avg"], "chunks": _stats["chunks"], "device": _stats["device"], "model": _stats["model"], "compute": _stats["compute"]})
                 else:
                     print(f"[{lang}|{lag:.1f}s|rms={rms:.4f}] <silence>", flush=True)
                     broadcast({"type": "stats", **_stats})
@@ -464,8 +286,18 @@ def caption_loop() -> None:
             broadcast({"type": "reconnecting"})
             time.sleep(2)
 
+# ── Stream switching ─────────────────────────────────────────────────────────
 
-# ── WebSocket server ──────────────────────────────────────────────────────────
+def set_stream_url(url: str) -> None:
+    global _current_stream_url, _active_language
+    with _stream_lock:
+        _current_stream_url = url
+    _active_language = ""
+    _stats["stream"] = url
+    _restart_flag.set()
+    print(f"[stream] switching to {url}", flush=True)
+
+# ── WebSocket server ─────────────────────────────────────────────────────────
 
 async def ws_handler(websocket, *args, **kwargs) -> None:
     with _clients_lock:
@@ -475,76 +307,53 @@ async def ws_handler(websocket, *args, **kwargs) -> None:
         async for raw in websocket:
             try:
                 msg = json.loads(raw)
-                if msg.get("type") == "set_stream":
-                    url = str(msg.get("url", "")).strip()
-                    if url:
-                        set_stream_url(url)
-                        broadcast({"type": "stream_changed", "url": url})
+                if msg.get("type") == "set_stream" and (url := str(msg.get("url", "")).strip()):
+                    set_stream_url(url)
+                    broadcast({"type": "stream_changed", "url": url})
             except Exception:
                 pass
     finally:
         with _clients_lock:
             _clients.discard(websocket)
 
-
 async def ws_server_main() -> None:
     global _loop
     _loop = asyncio.get_running_loop()
-    async with websockets.serve(ws_handler, "localhost", WS_PORT,
-                                ping_interval=20, ping_timeout=60):
+    async with websockets.serve(ws_handler, "localhost", WS_PORT, ping_interval=20, ping_timeout=60):
         print(f"[ws]   ws://localhost:{WS_PORT}", flush=True)
         await asyncio.Future()
 
+# ── HTTP server ──────────────────────────────────────────────────────────────
 
-# ── HTTP server ───────────────────────────────────────────────────────────────
-
-def make_http_handler(directory: str):
-    class Handler(SimpleHTTPRequestHandler):
-        def __init__(self, *a, **kw):
-            super().__init__(*a, directory=directory, **kw)
-
-        def log_message(self, fmt, *args):
-            pass  # suppress HTTP noise
-
-    return Handler
-
+class _QuietHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, directory=str(Path(__file__).parent), **kw)
+    def log_message(self, fmt, *args):
+        pass
 
 def start_http_server() -> None:
-    handler = make_http_handler(str(Path(__file__).parent))
-    server  = HTTPServer(("localhost", HTTP_PORT), handler)
+    server = HTTPServer(("localhost", HTTP_PORT), _QuietHandler)
     print(f"[http] http://localhost:{HTTP_PORT}", flush=True)
     server.serve_forever()
 
+# ── Entry point ──────────────────────────────────────────────────────────────
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-def check_deps() -> None:
-    result = subprocess.run(["where", "ffmpeg"], capture_output=True, text=True)
-    if result.returncode != 0:
+def main() -> None:
+    if subprocess.run(["where", "ffmpeg"], capture_output=True).returncode != 0:
         print("[error] ffmpeg not in PATH")
         sys.exit(1)
 
-
-def main() -> None:
-    check_deps()
     load_model()
-
-    sdi_launch_exe()  # launches exe + auto-starts stream (no browser click needed)
+    sdi_launch_exe()
 
     threading.Thread(target=start_http_server, daemon=True).start()
-    threading.Thread(target=caption_loop,       daemon=True).start()
-    threading.Thread(target=sdi_watchdog,        daemon=True).start()
+    threading.Thread(target=caption_loop, daemon=True).start()
 
     print(f"\n>>> http://localhost:{HTTP_PORT} <<<\n", flush=True)
     try:
         asyncio.run(ws_server_main())
     except KeyboardInterrupt:
         pass
-    finally:
-        print("\n[exit] stopping SDI stream...", flush=True)
-        _sdi_post("/stop")
-        print("[exit] done")
-
 
 if __name__ == "__main__":
     main()
