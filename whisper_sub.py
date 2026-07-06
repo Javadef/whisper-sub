@@ -38,6 +38,8 @@ OVERLAP_SEC = 0.5    # chunk overlap — preserves words at boundaries
 
 VIDEO_DELAY = 8.0    # seconds to pause MPV at start; tune to match Whisper lag
 
+SDI_CAP_FILE = Path(__file__).parent / "sdi2sdi_cap1.txt"
+
 CAPTION_BLOCKLIST = [
     "....",
     "....",
@@ -174,14 +176,22 @@ def caption_loop() -> None:
         text = " ".join(s.text.strip() for s in segments).strip()
         lag  = time.perf_counter() - t0
 
-        if text:
-            for blocked in CAPTION_BLOCKLIST:
-                if blocked.lower() in text.lower():
-                    text = "••••"
-                    break
-            print(f"[{info.language}|{lag:.1f}s lag] {text}", flush=True)
-            # {\an2} = ASS bottom-center alignment tag (MPV OSD respects it)
-            mpv_cmd(["show-text", r"{\an2}" + text, CAPTION_MS])
+            if text:
+                for blocked in CAPTION_BLOCKLIST:
+                    if blocked.lower() in text.lower():
+                        text = "••••"
+                        break
+                print(f"[{info.language}|{lag:.1f}s lag] {text}", flush=True)
+                # {\an2} = ASS bottom-center alignment tag (MPV OSD respects it)
+                mpv_cmd(["show-text", r"{\an2}" + text, CAPTION_MS])
+                try:
+                    SDI_CAP_FILE.write_text(text, encoding="utf-8")
+                except OSError:
+                    pass
+                try:
+                    SDI_CAP_FILE.write_text(text, encoding="utf-8")
+                except OSError:
+                    pass
 
 
 def launch_mpv() -> subprocess.Popen:

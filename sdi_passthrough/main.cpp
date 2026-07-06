@@ -25,7 +25,7 @@
 
 static constexpr uint32_t kAudioSizeMax = 401 * 1024;
 static constexpr ULWord   kAppType      = NTV2_FOURCC('S','D','P','T');
-static constexpr const char* kSubtitleFile = "C:\\Users\\Admin\\Desktop\\whisper-sub\\sdi2sdi_cap1.txt";
+static constexpr const char* kSubtitleFile = "C:\\Users\\Java\\Desktop\\whisper-sub\\sdi2sdi_cap1.txt";
 static constexpr uint16_t    kAudioPort    = 9876;
 static std::atomic<bool> gQuit{false};
 
@@ -185,7 +185,7 @@ static void DrawOverlay(uint8_t* buf, int stride, int frameW, int frameH,
     static bool sTried = false;
     if (!sTried) {
         sTried = true;
-        sBg = (HBITMAP)LoadImageA(nullptr, "C:\\Users\\Admin\\Desktop\\whisper-sub\\bg.bmp",
+        sBg = (HBITMAP)LoadImageA(nullptr, "C:\\Users\\Java\\Desktop\\whisper-sub\\bg.bmp",
                                   IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE);
         if (sBg) { BITMAP bm; GetObject(sBg, sizeof(bm), &bm); sBgW = bm.bmWidth; sBgH = bm.bmHeight; }
     }
@@ -494,7 +494,7 @@ int main() {
                     Utf8ToWide(ReadSubtitleFile(kSubtitleFile)));
         { static bool sSaved = false;
           if (!sSaved) { sSaved = true;
-            SaveFrameAsBMP("C:\\Users\\Admin\\Desktop\\whisper-sub\\overlay_preview.bmp",
+            SaveFrameAsBMP("C:\\Users\\Java\\Desktop\\whisper-sub\\overlay_preview.bmp",
                            (const uint8_t*)vidBufs[ri].data(), (int)W, (int)H, stride);
             std::cout << "\n[preview] saved overlay_preview.bmp\n" << std::flush; } }
         outXfer.SetVideoBuffer(vidBufs[ri].data(), fSize);

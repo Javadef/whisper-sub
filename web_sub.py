@@ -40,7 +40,7 @@ from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-STREAM_URL  = "http://213.230.64.74:1510/mix/index.m3u8"
+STREAM_URL  = "https://stream2-sarkor.clicktv.platform24.tv/mbrjwt/b34f22a36e730c70bd80b6ff598ffdf0a5b9df95-7061-0-clk3102913-5-3588636674-1783081179-e128-JzaLH-h2CTqEx3SjoWzD8dkQq1KN-EdQvQLo756Mxjw/index.m3u8?ml=true"
 SAMPLE_RATE = 16000
 CHUNK_SEC   = 5
 OVERLAP_SEC = 0.5
@@ -58,6 +58,8 @@ WS_PORT     = 8766
 
 SDI_EXE_PATH   = Path(__file__).parent / "sdi_passthrough" / "build" / "Release" / "sdi_passthrough.exe"
 SDI_AUTOLAUNCH = True
+
+USE_HLS_AUDIO = True  # True = pull audio directly from HLS stream (no AJA card needed)
 
 CAPTION_BLOCKLIST = (
     "Редактор субтитров",
@@ -88,11 +90,13 @@ _stats = {
 # ── SDI passthrough ──────────────────────────────────────────────────────────
 
 SDI2SDI_CAP_FILE = Path(__file__).parent / "sdi2sdi_cap1.txt"
+LATEST_CAPTION_FILE = Path(__file__).parent / "latest_caption.txt"
 
 def sdi_send_caption(text: str) -> None:
     wrapped = _wrap_caption(text)
     try:
         SDI2SDI_CAP_FILE.write_text(wrapped, encoding="utf-8")
+        LATEST_CAPTION_FILE.write_text(wrapped, encoding="utf-8")
     except OSError:
         pass
 
@@ -173,44 +177,86 @@ async def _broadcast_async(payload: str, clients: frozenset) -> None:
         except Exception:
             pass
 
-# ── Audio capture (via sdi_passthrough.exe TCP) ──────────────────────────────
+# ── Audio capture (via sdi_passthrough.exe TCP or HLS direct) ──────────────
 
 def audio_stream(stop: threading.Event):
-    SDI_TCP = "tcp://127.0.0.1:9876"
-    while not stop.is_set():
-        try:
-            proc = subprocess.Popen(
-                [
-                    "ffmpeg",
-                    "-f", "s16le", "-ar", "16000", "-ac", "1",
-                    "-i", SDI_TCP,
-                    "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1",
-                    "-loglevel", "quiet",
-                    "pipe:1",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as e:
-            print(f"[audio] ffmpeg launch failed: {e}", flush=True)
+    if USE_HLS_AUDIO:
+        while not stop.is_set():
+            try:
+                proc = subprocess.Popen(
+                    [
+                        "ffmpeg", "-re",
+                        "-i", STREAM_URL,
+                        "-vn",
+                        "-f", "s16le",
+                        "-ar", str(SAMPLE_RATE),
+                        "-ac", "1",
+                        "-loglevel", "quiet",
+                        "pipe:1",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                print(f"[audio] ffmpeg launch failed: {e}", flush=True)
+                time.sleep(2)
+                continue
+            bytes_chunk   = int(SAMPLE_RATE * 2 * CHUNK_SEC)
+            bytes_overlap = int(SAMPLE_RATE * 2 * OVERLAP_SEC)
+            buf = b""
+            try:
+                while not stop.is_set():
+                    raw = proc.stdout.read(8192)
+                    if not raw:
+                        break
+                    buf += raw
+                    while len(buf) >= bytes_chunk:
+                        pcm = buf[:bytes_chunk]
+                        buf = buf[bytes_chunk - bytes_overlap:]
+                        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                        yield audio
+            finally:
+                proc.terminate()
+            print("[audio] stream ended, reconnecting...", flush=True)
             time.sleep(2)
-            continue
-        bytes_chunk   = int(SAMPLE_RATE * 2 * CHUNK_SEC)
-        bytes_overlap = int(SAMPLE_RATE * 2 * OVERLAP_SEC)
-        buf = b""
-        try:
-            while not stop.is_set():
-                raw = proc.stdout.read(8192)
-                if not raw:
-                    break
-                buf += raw
-                while len(buf) >= bytes_chunk:
-                    pcm = buf[:bytes_chunk]
-                    buf = buf[bytes_chunk - bytes_overlap:]
-                    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                    yield audio
-        finally:
-            proc.terminate()
+    else:
+        SDI_TCP = "tcp://127.0.0.1:9876"
+        while not stop.is_set():
+            try:
+                proc = subprocess.Popen(
+                    [
+                        "ffmpeg",
+                        "-f", "s16le", "-ar", "16000", "-ac", "1",
+                        "-i", SDI_TCP,
+                        "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1",
+                        "-loglevel", "quiet",
+                        "pipe:1",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                print(f"[audio] ffmpeg launch failed: {e}", flush=True)
+                time.sleep(2)
+                continue
+            bytes_chunk   = int(SAMPLE_RATE * 2 * CHUNK_SEC)
+            bytes_overlap = int(SAMPLE_RATE * 2 * OVERLAP_SEC)
+            buf = b""
+            try:
+                while not stop.is_set():
+                    raw = proc.stdout.read(8192)
+                    if not raw:
+                        break
+                    buf += raw
+                    while len(buf) >= bytes_chunk:
+                        pcm = buf[:bytes_chunk]
+                        buf = buf[bytes_chunk - bytes_overlap:]
+                        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                        yield audio
+            finally:
+                proc.terminate()
+            print("[audio] SDI stream ended, reconnecting...", flush=True)
+            time.sleep(2)
 
 # ── Transcription loop ───────────────────────────────────────────────────────
 
